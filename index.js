@@ -2,7 +2,6 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { google } = require('googleapis');
-// Kita hanya butuh MailComposer dari nodemailer untuk menyusun attachment, bukan untuk ngirim (SMTP)
 const MailComposer = require('nodemailer/lib/mail-composer');
 
 const app = express();
@@ -10,22 +9,30 @@ app.use(cors());
 app.use(express.json());
 
 // ==============================================================================
-// SETUP SATU KREDENSIAL UTAMA (Meniru "sparta_creds" di Python)
-// Kredensial ini punya akses komplit: Sheets, Drive, dan Gmail API.
-// ===============================================================================
+// 1. KREDENSIAL "DOC" -> KHUSUS UNTUK MEMBACA GOOGLE SHEETS
+// ==============================================================================
+const docOAuth2Client = new google.auth.OAuth2(
+    process.env.DOC_GOOGLE_CLIENT_ID,
+    process.env.DOC_GOOGLE_CLIENT_SECRET,
+    "https://developers.google.com/oauthplayground"
+);
+docOAuth2Client.setCredentials({ refresh_token: process.env.DOC_GOOGLE_REFRESH_TOKEN });
+const sheets = google.sheets({ version: 'v4', auth: docOAuth2Client });
+
+
+// ==============================================================================
+// 2. KREDENSIAL "UTAMA" -> KHUSUS UNTUK DRIVE (DOWNLOAD) & GMAIL API (KIRIM)
+// ==============================================================================
 const spartaOAuth2Client = new google.auth.OAuth2(
     process.env.GOOGLE_CLIENT_ID,
     process.env.GOOGLE_CLIENT_SECRET,
     "https://developers.google.com/oauthplayground"
 );
-// Pastikan GOOGLE_REFRESH_TOKEN di Render diisi copy-an dari token.json Python!
 spartaOAuth2Client.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN });
-
-const sheets = google.sheets({ version: 'v4', auth: spartaOAuth2Client });
 const drive = google.drive({ version: 'v3', auth: spartaOAuth2Client });
 const gmail = google.gmail({ version: 'v1', auth: spartaOAuth2Client });
 
-
+// --- Helper Functions ---
 function extractFileId(url) {
     if (!url) return null;
     const match = url.match(/(?:id=|d\/|file\/d\/)([\w-]{25,})/);
@@ -64,7 +71,7 @@ app.post('/api/resend-email', async (req, res) => {
 
         const sheetId = process.env.DOC_SHEET_ID;
 
-        // --- STEP A: Cari Data di form2 ---
+        // --- STEP A: Cari Data di form2 (Pakai Sheets API via Akun DOC) ---
         const responseForm2 = await sheets.spreadsheets.values.get({
             spreadsheetId: sheetId,
             range: 'form2!A:O',
@@ -106,7 +113,7 @@ app.post('/api/resend-email', async (req, res) => {
 
         if (!cabang) return res.status(400).json({ error: 'Kolom cabang kosong.' });
 
-        // --- STEP C: Cari Email di Sheet Cabang ---
+        // --- STEP C: Cari Email di Sheet Cabang (Pakai Sheets API via Akun DOC) ---
         const responseCabang = await sheets.spreadsheets.values.get({
             spreadsheetId: sheetId,
             range: 'Cabang!A:Z',
@@ -127,13 +134,13 @@ app.post('/api/resend-email', async (req, res) => {
         });
 
         if (!matchRowCabang || !matchRowCabang[idxEmail]) {
-            return res.status(404).json({ error: `Email tujuan tidak ditemukan.` });
+            return res.status(404).json({ error: `Email tujuan tidak ditemukan untuk cabang ${cabang}.` });
         }
 
         const recipientEmail = String(matchRowCabang[idxEmail]).trim();
         console.log(`[API] Email tujuan ditemukan: ${recipientEmail} (${role})`);
 
-        // --- STEP D: Download PDF ---
+        // --- STEP D: Download PDF (Pakai Drive API via Akun Utama) ---
         const attachments = [];
         const pdfId = extractFileId(linkPdf);
         const pdfNonSboId = extractFileId(linkPdfNonSbo);
@@ -148,7 +155,6 @@ app.post('/api/resend-email', async (req, res) => {
         }
 
         // --- STEP E: Kirim Email via GMAIL API (Bebas dari Error IPv6) ---
-        // Ini meniru persis metode self.gmail_service.users().messages().send() di Python
         const mailOptions = {
             from: `"Sparta System" <${process.env.EMAIL_USER}>`,
             to: recipientEmail,
@@ -171,17 +177,14 @@ app.post('/api/resend-email', async (req, res) => {
             attachments: attachments
         };
 
-        // Buat struktur email mentah (Raw MIME)
         const mail = new MailComposer(mailOptions);
         const messageBuffer = await mail.compile().build();
 
-        // Encode ke Base64 (Sama persis dengan base64.urlsafe_b64encode di Python)
         const encodedMessage = messageBuffer.toString('base64')
             .replace(/\+/g, '-')
             .replace(/\//g, '_')
             .replace(/=+$/, '');
 
-        // Tembak langsung ke API Google
         const result = await gmail.users.messages.send({
             userId: 'me',
             requestBody: { raw: encodedMessage }
