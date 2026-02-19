@@ -478,7 +478,7 @@ app.post('/api/resend-email', async (req, res) => {
         }
 
         // --- STEP E: Kirim Email via GMAIL API ---
-        const fromAddress = `"Sparta System" <${getEnvValue('EMAIL_USER')}>`;
+        const fromAddress = `"Sparta System Resend Email" <${getEnvValue('EMAIL_USER')}>`;
 
         async function sendMailViaGmail(mailOptions) {
             const mail = new MailComposer(mailOptions);
@@ -501,7 +501,7 @@ app.post('/api/resend-email', async (req, res) => {
         let sentMessageIds = [];
 
         if (isFinalApproved) {
-            const subject = `[FINAL - DISETUJUI] Pengajuan RAB Proyek ${namaToko}: ${proyek} - ${rowLingkup}`;
+            const subject = `[RE-EMAIL][FINAL - DISETUJUI] Pengajuan RAB Proyek ${namaToko}: ${proyek} - ${rowLingkup}`;
             const baseBody = buildRabFinalApprovedEmailHtml({
                 namaToko,
                 proyek,
@@ -548,8 +548,8 @@ app.post('/api/resend-email', async (req, res) => {
                 from: fromAddress,
                 to: recipientEmailsStr,
                 subject: approvalLevel === 'coordinator'
-                    ? `[TAHAP 1: PERLU PERSETUJUAN] RAB Proyek ${proyek} - ${rowLingkup}`
-                    : `[TAHAP 2: PERLU PERSETUJUAN] RAB Proyek ${proyek} - ${rowLingkup}`,
+                    ? `[RE-EMAIL][TAHAP 1: PERLU PERSETUJUAN] RAB Proyek ${proyek} - ${rowLingkup}`
+                    : `[RE-EMAIL][TAHAP 2: PERLU PERSETUJUAN] RAB Proyek ${proyek} - ${rowLingkup}`,
                 html: buildRabApprovalEmailHtml({
                     level: role,
                     proyek,
