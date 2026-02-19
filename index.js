@@ -12,7 +12,7 @@ app.use(express.json());
 // ==============================================================================
 // SETUP SATU KREDENSIAL UTAMA (Meniru "sparta_creds" di Python)
 // Kredensial ini punya akses komplit: Sheets, Drive, dan Gmail API.
-// ==============================================================================
+// ===============================================================================
 const spartaOAuth2Client = new google.auth.OAuth2(
     process.env.GOOGLE_CLIENT_ID,
     process.env.GOOGLE_CLIENT_SECRET,
