@@ -176,6 +176,60 @@ function normalizeString(str) {
     return String(str).replace(/-/g, "").replace(/\s/g, "").trim().toUpperCase();
 }
 
+const SPARTA_BACKEND_BASE_URL = getEnvValue('SPARTA_BACKEND_BASE_URL') || 'https://sparta-backend-5hdj.onrender.com';
+
+function escapeHtml(text) {
+    return String(text ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+function buildRabApprovalEmailHtml({
+    level,
+    proyek,
+    nomorUlok,
+    approvalUrl,
+    rejectionUrl,
+    additionalInfo,
+}) {
+    const infoBlock = additionalInfo
+        ? `<p style="font-style: italic;">${escapeHtml(additionalInfo)}</p>`
+        : '';
+
+    return `
+<!DOCTYPE html>
+<html>
+<head>
+    <style>
+        .button { padding: 10px 20px; text-decoration: none; color: white !important; border-radius: 5px; }
+        .approve { background-color: #28a745; }
+        .reject { background-color: #dc3545; }
+    </style>
+</head>
+<body>
+    <p>Yth. Bapak/Ibu ${escapeHtml(level)},</p>
+    <p>
+        Dokumen RAB untuk proyek
+        <strong>${escapeHtml(proyek)}</strong>
+        dengan Nomor Ulok <strong>${escapeHtml(nomorUlok)}</strong>
+        memerlukan tinjauan dan persetujuan Anda.
+    </p>
+    ${infoBlock}
+    <p>Silakan periksa detailnya pada file PDF yang terlampir dan pilih tindakan di bawah ini:</p>
+    <br>
+    <a href="${approvalUrl}" class="button approve">SETUJUI</a>
+    <a href="${rejectionUrl}" class="button reject">TOLAK</a>
+    <br><br>
+    <p>Terima kasih.</p>
+    <p><em>--- Email ini dibuat secara otomatis.---</em></p>
+</body>
+</html>
+`;
+}
+
 async function getClientScopeInfo(oauthClient) {
     try {
         const accessToken = await oauthClient.getAccessToken();
@@ -253,13 +307,17 @@ app.post('/api/resend-email', async (req, res) => {
         const normalizedTargetUlok = normalizeString(ulok);
         const normalizedTargetLingkup = String(lingkup).trim().toLowerCase();
 
-        const targetRow = rowsForm2.slice(1).find(row => {
+        const dataRowsForm2 = rowsForm2.slice(1);
+        const targetRowRelativeIndex = dataRowsForm2.findIndex(row => {
             const rowUlok = normalizeString(row[9]);
             const rowLingkup = String(row[13] || "").trim().toLowerCase();
             return rowUlok === normalizedTargetUlok && rowLingkup === normalizedTargetLingkup;
         });
 
-        if (!targetRow) return res.status(404).json({ error: 'Data tidak ditemukan di form2.' });
+        if (targetRowRelativeIndex === -1) return res.status(404).json({ error: 'Data tidak ditemukan di form2.' });
+
+        const targetRow = dataRowsForm2[targetRowRelativeIndex];
+        const sheetRowNumber = targetRowRelativeIndex + 2;
 
         const [
             status, timestamp, linkPdf, linkPdfNonSbo,
@@ -270,13 +328,16 @@ app.post('/api/resend-email', async (req, res) => {
         // --- STEP B: Tentukan Role ---
         let role = '';
         let targetJabatan = '';
+        let approvalLevel = '';
 
         if (status === 'Menunggu Persetujuan Koordinator') {
             role = 'Koordinator';
             targetJabatan = 'BRANCH BUILDING COORDINATOR';
+            approvalLevel = 'coordinator';
         } else if (status === 'Menunggu Persetujuan Manager') {
             role = 'Manager';
             targetJabatan = 'BRANCH BUILDING & MAINTENANCE MANAGER';
+            approvalLevel = 'manager';
         } else {
             return res.status(200).json({ message: `Email tidak dikirim. Status saat ini: "${status}"` });
         }
@@ -324,6 +385,15 @@ app.post('/api/resend-email', async (req, res) => {
         const recipientEmailsStr = recipientEmailsArray.join(', ');
         console.log(`[API] Email tujuan ditemukan (${recipientEmailsArray.length} orang): ${recipientEmailsStr} (${role})`);
 
+        const approverForLink = recipientEmailsArray[0];
+        const encodedApprover = encodeURIComponent(approverForLink);
+        const approvalUrl = `${SPARTA_BACKEND_BASE_URL}/api/handle_rab_approval?action=approve&row=${sheetRowNumber}&level=${approvalLevel}&approver=${encodedApprover}`;
+        const rejectionUrl = `${SPARTA_BACKEND_BASE_URL}/api/reject_form/rab?row=${sheetRowNumber}&level=${approvalLevel}&approver=${encodedApprover}`;
+
+        const additionalInfo = approvalLevel === 'manager' && emailKoord_old
+            ? `Telah disetujui oleh Koordinator: ${emailKoord_old}`
+            : '';
+
 
         // --- STEP D: Download PDF (Sekarang pakai DOC Auth) ---
         const attachments = [];
@@ -343,22 +413,17 @@ app.post('/api/resend-email', async (req, res) => {
         const mailOptions = {
             from: `"Sparta System" <${getEnvValue('EMAIL_USER')}>`,
             to: recipientEmailsStr, // <-- Menggunakan gabungan koma
-            subject: `[REMINDER] Persetujuan RAB - ${proyek} - Cabang ${cabang}`,
-            html: `
-                <h3>Halo,</h3>
-                <p>Ini adalah pengingat bahwa terdapat dokumen RAB yang membutuhkan persetujuan Anda sebagai <strong>${role}</strong>.</p>
-                <ul>
-                    <li><strong>Proyek:</strong> ${proyek}</li>
-                    <li><strong>Cabang:</strong> ${cabang}</li>
-                    <li><strong>Ulok:</strong> ${rowUlok}</li>
-                    <li><strong>Lingkup Pekerjaan:</strong> ${rowLingkup}</li>
-                    <li><strong>Pembuat:</strong> ${emailPembuat}</li>
-                </ul>
-                <p>Dokumen PDF terlampir pada email ini. Mohon segera diproses ke dalam sistem Sparta.</p>
-                <br/>
-                <p>Terima kasih,</p>
-                <p><strong>Building & Maintenance Dept.</strong></p>
-            `,
+            subject: approvalLevel === 'coordinator'
+                ? `[TAHAP 1: PERLU PERSETUJUAN] RAB Proyek ${proyek} - ${rowLingkup}`
+                : `[TAHAP 2: PERLU PERSETUJUAN] RAB Proyek ${proyek} - ${rowLingkup}`,
+            html: buildRabApprovalEmailHtml({
+                level: role,
+                proyek,
+                nomorUlok: rowUlok,
+                approvalUrl,
+                rejectionUrl,
+                additionalInfo,
+            }),
             attachments: attachments
         };
 
