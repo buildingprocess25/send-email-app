@@ -9,7 +9,8 @@ app.use(cors());
 app.use(express.json());
 
 // ==============================================================================
-// 1. KREDENSIAL "DOC" -> KHUSUS UNTUK MEMBACA GOOGLE SHEETS
+// 1. KREDENSIAL "DOC" -> KHUSUS MEMBACA SHEETS DAN DOWNLOAD DRIVE
+// Karena Sparta simpan PDF-nya pakai kredensial DOC, downloadnya wajib pakai DOC
 // ==============================================================================
 const docOAuth2Client = new google.auth.OAuth2(
     process.env.DOC_GOOGLE_CLIENT_ID,
@@ -17,11 +18,13 @@ const docOAuth2Client = new google.auth.OAuth2(
     "https://developers.google.com/oauthplayground"
 );
 docOAuth2Client.setCredentials({ refresh_token: process.env.DOC_GOOGLE_REFRESH_TOKEN });
+
 const sheets = google.sheets({ version: 'v4', auth: docOAuth2Client });
+const drive = google.drive({ version: 'v3', auth: docOAuth2Client }); // <-- KEMBALI PAKAI DOC
 
 
 // ==============================================================================
-// 2. KREDENSIAL "UTAMA" -> KHUSUS UNTUK DRIVE (DOWNLOAD) & GMAIL API (KIRIM)
+// 2. KREDENSIAL "UTAMA" -> KHUSUS UNTUK GMAIL API (KIRIM EMAIL)
 // ==============================================================================
 const spartaOAuth2Client = new google.auth.OAuth2(
     process.env.GOOGLE_CLIENT_ID,
@@ -29,7 +32,7 @@ const spartaOAuth2Client = new google.auth.OAuth2(
     "https://developers.google.com/oauthplayground"
 );
 spartaOAuth2Client.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN });
-const drive = google.drive({ version: 'v3', auth: spartaOAuth2Client });
+
 const gmail = google.gmail({ version: 'v1', auth: spartaOAuth2Client });
 
 // --- Helper Functions ---
@@ -46,9 +49,10 @@ async function downloadDriveFile(fileId) {
             { fileId: fileId, alt: 'media' },
             { responseType: 'arraybuffer' }
         );
+        console.log(`[Drive] Berhasil mengunduh ID: ${fileId}`);
         return Buffer.from(response.data);
     } catch (error) {
-        console.error(`Gagal mengunduh file ID ${fileId}:`, error.message);
+        console.error(`[Drive] Gagal mengunduh file ID ${fileId}:`, error.message);
         return null;
     }
 }
@@ -71,7 +75,7 @@ app.post('/api/resend-email', async (req, res) => {
 
         const sheetId = process.env.DOC_SHEET_ID;
 
-        // --- STEP A: Cari Data di form2 (Pakai Sheets API via Akun DOC) ---
+        // --- STEP A: Cari Data di form2 ---
         const responseForm2 = await sheets.spreadsheets.values.get({
             spreadsheetId: sheetId,
             range: 'form2!A:O',
@@ -113,7 +117,7 @@ app.post('/api/resend-email', async (req, res) => {
 
         if (!cabang) return res.status(400).json({ error: 'Kolom cabang kosong.' });
 
-        // --- STEP C: Cari Email di Sheet Cabang (Pakai Sheets API via Akun DOC) ---
+        // --- STEP C: Cari BANYAK Email di Sheet Cabang (Menggunakan .filter) ---
         const responseCabang = await sheets.spreadsheets.values.get({
             spreadsheetId: sheetId,
             range: 'Cabang!A:Z',
@@ -127,20 +131,35 @@ app.post('/api/resend-email', async (req, res) => {
         const idxJabatan = headersCabang.indexOf('JABATAN');
         const idxEmail = headersCabang.indexOf('EMAIL_SAT');
 
-        const matchRowCabang = rowsCabang.slice(1).find(row => {
+        const targetCabangUpper = String(cabang).trim().toUpperCase();
+        const targetJabatanUpper = targetJabatan.toUpperCase();
+
+        // Gunakan .filter() untuk mencari SEMUA baris yang cocok
+        const matchRowsCabang = rowsCabang.slice(1).filter(row => {
             const valCabang = String(row[idxCabang] || "").trim().toUpperCase();
             const valJabatan = String(row[idxJabatan] || "").trim().toUpperCase();
-            return valCabang === String(cabang).trim().toUpperCase() && valJabatan === targetJabatan.toUpperCase();
+            return valCabang === targetCabangUpper && valJabatan === targetJabatanUpper;
         });
 
-        if (!matchRowCabang || !matchRowCabang[idxEmail]) {
-            return res.status(404).json({ error: `Email tujuan tidak ditemukan untuk cabang ${cabang}.` });
+        if (matchRowsCabang.length === 0) {
+            return res.status(404).json({ error: `Jabatan ${targetJabatan} tidak ditemukan di cabang ${cabang}.` });
         }
 
-        const recipientEmail = String(matchRowCabang[idxEmail]).trim();
-        console.log(`[API] Email tujuan ditemukan: ${recipientEmail} (${role})`);
+        // Kumpulkan semua email valid ke dalam Array, lalu gabungkan dengan koma
+        const recipientEmailsArray = matchRowsCabang
+            .map(row => String(row[idxEmail] || "").trim())
+            .filter(email => email !== ""); // Buang kalau ada cell email yang kosong
 
-        // --- STEP D: Download PDF (Pakai Drive API via Akun Utama) ---
+        if (recipientEmailsArray.length === 0) {
+            return res.status(404).json({ error: `Email tujuan ditemukan tapi datanya kosong di sheet Cabang.` });
+        }
+
+        // Format akhirnya jadi: "email1@gmail.com, email2@gmail.com"
+        const recipientEmailsStr = recipientEmailsArray.join(', ');
+        console.log(`[API] Email tujuan ditemukan (${recipientEmailsArray.length} orang): ${recipientEmailsStr} (${role})`);
+
+
+        // --- STEP D: Download PDF (Sekarang pakai DOC Auth) ---
         const attachments = [];
         const pdfId = extractFileId(linkPdf);
         const pdfNonSboId = extractFileId(linkPdfNonSbo);
@@ -154,10 +173,10 @@ app.post('/api/resend-email', async (req, res) => {
             if (pdfNonSboBuffer) attachments.push({ filename: 'RAB_NON_SBO.pdf', content: pdfNonSboBuffer });
         }
 
-        // --- STEP E: Kirim Email via GMAIL API (Bebas dari Error IPv6) ---
+        // --- STEP E: Kirim Email via GMAIL API ---
         const mailOptions = {
             from: `"Sparta System" <${process.env.EMAIL_USER}>`,
-            to: recipientEmail,
+            to: recipientEmailsStr, // <-- Menggunakan gabungan koma
             subject: `[REMINDER] Persetujuan RAB - ${proyek} - Cabang ${cabang}`,
             html: `
                 <h3>Halo,</h3>
@@ -194,7 +213,7 @@ app.post('/api/resend-email', async (req, res) => {
 
         return res.status(200).json({
             message: 'Email berhasil dikirim.',
-            recipient: recipientEmail,
+            recipient: recipientEmailsStr,
             role: role,
             messageId: result.data.id
         });
