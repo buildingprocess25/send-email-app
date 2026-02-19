@@ -2,37 +2,28 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { google } = require('googleapis');
-const nodemailer = require('nodemailer');
+// Kita hanya butuh MailComposer dari nodemailer untuk menyusun attachment, bukan untuk ngirim (SMTP)
+const MailComposer = require('nodemailer/lib/mail-composer');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 // ==============================================================================
-// 1. Setup OAuth2 Client untuk SHEETS (Tetap pakai DOC_ jika sheetnya ada di sana)
+// SETUP SATU KREDENSIAL UTAMA (Meniru "sparta_creds" di Python)
+// Kredensial ini punya akses komplit: Sheets, Drive, dan Gmail API.
 // ==============================================================================
-const docOAuth2Client = new google.auth.OAuth2(
-    process.env.DOC_GOOGLE_CLIENT_ID,
-    process.env.DOC_GOOGLE_CLIENT_SECRET,
-    "https://developers.google.com/oauthplayground"
-);
-docOAuth2Client.setCredentials({ refresh_token: process.env.DOC_GOOGLE_REFRESH_TOKEN });
-
-const sheets = google.sheets({ version: 'v4', auth: docOAuth2Client });
-
-// ==============================================================================
-// 2. Setup OAuth2 Client UTAMA (Untuk Email & DRIVE)
-//    Kita pakai ini untuk Drive juga agar tidak error 404 saat download file
-// ==============================================================================
-const mailOAuth2Client = new google.auth.OAuth2(
+const spartaOAuth2Client = new google.auth.OAuth2(
     process.env.GOOGLE_CLIENT_ID,
     process.env.GOOGLE_CLIENT_SECRET,
     "https://developers.google.com/oauthplayground"
 );
-mailOAuth2Client.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN });
+// Pastikan GOOGLE_REFRESH_TOKEN di Render diisi copy-an dari token.json Python!
+spartaOAuth2Client.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN });
 
-// Pakai auth utama untuk Drive
-const drive = google.drive({ version: 'v3', auth: mailOAuth2Client });
+const sheets = google.sheets({ version: 'v4', auth: spartaOAuth2Client });
+const drive = google.drive({ version: 'v3', auth: spartaOAuth2Client });
+const gmail = google.gmail({ version: 'v1', auth: spartaOAuth2Client });
 
 
 function extractFileId(url) {
@@ -50,13 +41,11 @@ async function downloadDriveFile(fileId) {
         );
         return Buffer.from(response.data);
     } catch (error) {
-        // Log error tapi jangan biarkan aplikasi crash
         console.error(`Gagal mengunduh file ID ${fileId}:`, error.message);
         return null;
     }
 }
 
-// Fungsi untuk menyamakan format Ulok (Hapus strip dan spasi)
 function normalizeString(str) {
     if (!str) return "";
     return String(str).replace(/-/g, "").replace(/\s/g, "").trim().toUpperCase();
@@ -75,32 +64,25 @@ app.post('/api/resend-email', async (req, res) => {
 
         const sheetId = process.env.DOC_SHEET_ID;
 
-        // -------------------------------------------------------------
-        // STEP A: AMBIL DATA DARI form2 UNTUK CEK STATUS & CABANG
-        // -------------------------------------------------------------
+        // --- STEP A: Cari Data di form2 ---
         const responseForm2 = await sheets.spreadsheets.values.get({
             spreadsheetId: sheetId,
             range: 'form2!A:O',
         });
 
         const rowsForm2 = responseForm2.data.values;
-        if (!rowsForm2 || rowsForm2.length === 0) {
-            return res.status(404).json({ error: 'Data tidak ditemukan di Google Sheet (form2).' });
-        }
+        if (!rowsForm2 || rowsForm2.length === 0) return res.status(404).json({ error: 'Data form2 kosong.' });
 
         const normalizedTargetUlok = normalizeString(ulok);
         const normalizedTargetLingkup = String(lingkup).trim().toLowerCase();
 
-        // Cari baris menggunakan INDEX: Ulok (Index 9) & Lingkup (Index 13)
         const targetRow = rowsForm2.slice(1).find(row => {
             const rowUlok = normalizeString(row[9]);
             const rowLingkup = String(row[13] || "").trim().toLowerCase();
             return rowUlok === normalizedTargetUlok && rowLingkup === normalizedTargetLingkup;
         });
 
-        if (!targetRow) {
-            return res.status(404).json({ error: 'Data dengan Ulok dan Lingkup Pekerjaan tersebut tidak ditemukan di form2.' });
-        }
+        if (!targetRow) return res.status(404).json({ error: 'Data tidak ditemukan di form2.' });
 
         const [
             status, timestamp, linkPdf, linkPdfNonSbo,
@@ -108,9 +90,7 @@ app.post('/api/resend-email', async (req, res) => {
             emailPembuat, rowUlok, proyek, alamat, cabang, rowLingkup
         ] = targetRow;
 
-        // -------------------------------------------------------------
-        // STEP B: TENTUKAN TARGET JABATAN BERDASARKAN STATUS
-        // -------------------------------------------------------------
+        // --- STEP B: Tentukan Role ---
         let role = '';
         let targetJabatan = '';
 
@@ -124,82 +104,51 @@ app.post('/api/resend-email', async (req, res) => {
             return res.status(200).json({ message: `Email tidak dikirim. Status saat ini: "${status}"` });
         }
 
-        if (!cabang) {
-            return res.status(400).json({ error: 'Kolom cabang di form2 kosong, tidak bisa mencari email tujuan.' });
-        }
+        if (!cabang) return res.status(400).json({ error: 'Kolom cabang kosong.' });
 
-        // -------------------------------------------------------------
-        // STEP C: CARI EMAIL DI SHEET "Cabang"
-        // -------------------------------------------------------------
+        // --- STEP C: Cari Email di Sheet Cabang ---
         const responseCabang = await sheets.spreadsheets.values.get({
             spreadsheetId: sheetId,
             range: 'Cabang!A:Z',
         });
 
         const rowsCabang = responseCabang.data.values;
-        if (!rowsCabang || rowsCabang.length === 0) {
-            return res.status(404).json({ error: 'Sheet Cabang kosong atau tidak ditemukan.' });
-        }
+        if (!rowsCabang) return res.status(404).json({ error: 'Sheet Cabang kosong.' });
 
         const headersCabang = rowsCabang[0].map(h => String(h).trim().toUpperCase());
         const idxCabang = headersCabang.indexOf('CABANG');
         const idxJabatan = headersCabang.indexOf('JABATAN');
         const idxEmail = headersCabang.indexOf('EMAIL_SAT');
 
-        if (idxCabang === -1 || idxJabatan === -1 || idxEmail === -1) {
-            return res.status(500).json({ error: 'Format header di sheet Cabang salah. Pastikan ada kolom CABANG, JABATAN, dan EMAIL_SAT.' });
-        }
-
-        const targetCabangUpper = String(cabang).trim().toUpperCase();
-        const targetJabatanUpper = targetJabatan.toUpperCase();
-
         const matchRowCabang = rowsCabang.slice(1).find(row => {
             const valCabang = String(row[idxCabang] || "").trim().toUpperCase();
             const valJabatan = String(row[idxJabatan] || "").trim().toUpperCase();
-            return valCabang === targetCabangUpper && valJabatan === targetJabatanUpper;
+            return valCabang === String(cabang).trim().toUpperCase() && valJabatan === targetJabatan.toUpperCase();
         });
 
         if (!matchRowCabang || !matchRowCabang[idxEmail]) {
-            return res.status(404).json({ error: `Gagal mengirim. Email untuk jabatan ${targetJabatan} di cabang ${cabang} tidak ditemukan di sheet Cabang.` });
+            return res.status(404).json({ error: `Email tujuan tidak ditemukan.` });
         }
 
         const recipientEmail = String(matchRowCabang[idxEmail]).trim();
-        console.log(`[API] Email tujuan ditemukan: ${recipientEmail} (${role} - ${cabang})`);
+        console.log(`[API] Email tujuan ditemukan: ${recipientEmail} (${role})`);
 
-        // -------------------------------------------------------------
-        // STEP D: DOWNLOAD PDF & KIRIM EMAIL
-        // -------------------------------------------------------------
+        // --- STEP D: Download PDF ---
         const attachments = [];
         const pdfId = extractFileId(linkPdf);
         const pdfNonSboId = extractFileId(linkPdfNonSbo);
 
-        // Download file (sekarang pakai auth Utama, semoga 404 hilang)
         if (pdfId) {
             const pdfBuffer = await downloadDriveFile(pdfId);
             if (pdfBuffer) attachments.push({ filename: 'RAB_SBO.pdf', content: pdfBuffer });
         }
-
         if (pdfNonSboId) {
             const pdfNonSboBuffer = await downloadDriveFile(pdfNonSboId);
             if (pdfNonSboBuffer) attachments.push({ filename: 'RAB_NON_SBO.pdf', content: pdfNonSboBuffer });
         }
 
-        const accessToken = await mailOAuth2Client.getAccessToken();
-
-        // KONFIGURASI FIX IPV6: Tambahkan family: 4
-        const transporter = nodemailer.createTransport({
-            service: 'gmail',
-            family: 4, // <--- INI PENTING! Memaksa pakai IPv4
-            auth: {
-                type: 'OAuth2',
-                user: process.env.EMAIL_USER,
-                clientId: process.env.GOOGLE_CLIENT_ID,
-                clientSecret: process.env.GOOGLE_CLIENT_SECRET,
-                refreshToken: process.env.GOOGLE_REFRESH_TOKEN,
-                accessToken: accessToken.token,
-            },
-        });
-
+        // --- STEP E: Kirim Email via GMAIL API (Bebas dari Error IPv6) ---
+        // Ini meniru persis metode self.gmail_service.users().messages().send() di Python
         const mailOptions = {
             from: `"Sparta System" <${process.env.EMAIL_USER}>`,
             to: recipientEmail,
@@ -222,13 +171,29 @@ app.post('/api/resend-email', async (req, res) => {
             attachments: attachments
         };
 
-        const result = await transporter.sendMail(mailOptions);
+        // Buat struktur email mentah (Raw MIME)
+        const mail = new MailComposer(mailOptions);
+        const messageBuffer = await mail.compile().build();
+
+        // Encode ke Base64 (Sama persis dengan base64.urlsafe_b64encode di Python)
+        const encodedMessage = messageBuffer.toString('base64')
+            .replace(/\+/g, '-')
+            .replace(/\//g, '_')
+            .replace(/=+$/, '');
+
+        // Tembak langsung ke API Google
+        const result = await gmail.users.messages.send({
+            userId: 'me',
+            requestBody: { raw: encodedMessage }
+        });
+
+        console.log(`[Email] Sukses terkirim via Gmail API. ID: ${result.data.id}`);
 
         return res.status(200).json({
             message: 'Email berhasil dikirim.',
             recipient: recipientEmail,
             role: role,
-            messageId: result.messageId
+            messageId: result.data.id
         });
 
     } catch (error) {
