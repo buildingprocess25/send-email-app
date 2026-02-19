@@ -230,6 +230,36 @@ function buildRabApprovalEmailHtml({
 `;
 }
 
+function buildRabFinalApprovedEmailHtml({
+    namaToko,
+    proyek,
+    lingkup,
+    pdfNonSboFilename,
+    pdfRekapFilename,
+    linkPdfNonSbo,
+    linkPdfRekap,
+}) {
+    return `
+<p>Pengajuan RAB Toko <b>${escapeHtml(namaToko)}</b> untuk proyek <b>${escapeHtml(proyek)} - ${escapeHtml(lingkup)}</b> telah disetujui sepenuhnya.</p>
+<p>Tiga versi file PDF RAB telah dilampirkan:</p>
+<ul>
+<li><b>${escapeHtml(pdfNonSboFilename)}</b>: Hanya berisi item pekerjaan di luar SBO.</li>
+<li><b>${escapeHtml(pdfRekapFilename)}</b>: Rekapitulasi Total Biaya.</li>
+</ul>
+<p>Link Google Drive:</p>
+<ul>
+<li><a href="${escapeHtml(linkPdfNonSbo || '')}">Link PDF Non-SBO</a></li>
+<li><a href="${escapeHtml(linkPdfRekap || '')}">Link PDF Rekapitulasi</a></li>
+</ul>
+`;
+}
+
+function buildRabFinalApprovedKontraktorHtml(baseBody) {
+    return `${baseBody}
+<p>Silakan upload Rekapitulasi RAB Termaterai & SPH melalui link berikut:</p>
+<p><a href="https://materai-rab-pi.vercel.app/login" target="_blank">UPLOAD REKAP RAB TERMATERAI & SPH</a></p>`;
+}
+
 async function getClientScopeInfo(oauthClient) {
     try {
         const accessToken = await oauthClient.getAccessToken();
@@ -327,20 +357,26 @@ app.post('/api/resend-email', async (req, res) => {
         ] = targetRow;
         const idxLinkPdfRekap = headersForm2.indexOf('LINK PDF REKAPITULASI');
         const linkPdfRekap = idxLinkPdfRekap >= 0 ? targetRow[idxLinkPdfRekap] : targetRow[25];
+        const idxNamaToko = headersForm2.indexOf('NAMA_TOKO');
+        const namaToko = idxNamaToko >= 0 ? targetRow[idxNamaToko] : proyek;
 
         // --- STEP B: Tentukan Role ---
         let role = '';
         let targetJabatan = '';
         let approvalLevel = '';
+        let isFinalApproved = false;
 
         if (status === 'Menunggu Persetujuan Koordinator') {
             role = 'Koordinator';
             targetJabatan = 'BRANCH BUILDING COORDINATOR';
             approvalLevel = 'coordinator';
-        } else if (status === 'Menunggu Persetujuan Manajer') {
+        } else if (status === 'Menunggu Persetujuan Manager') {
             role = 'Manager';
             targetJabatan = 'BRANCH BUILDING & MAINTENANCE MANAGER';
             approvalLevel = 'manager';
+        } else if (status === 'Disetujui') {
+            role = 'Final Approved';
+            isFinalApproved = true;
         } else {
             return res.status(200).json({ message: `Email tidak dikirim. Status saat ini: "${status}"` });
         }
@@ -363,22 +399,46 @@ app.post('/api/resend-email', async (req, res) => {
 
         const targetCabangUpper = String(cabang).trim().toUpperCase();
         const targetJabatanUpper = targetJabatan.toUpperCase();
+        let recipientEmailsArray = [];
 
-        // Gunakan .filter() untuk mencari SEMUA baris yang cocok
-        const matchRowsCabang = rowsCabang.slice(1).filter(row => {
-            const valCabang = String(row[idxCabang] || "").trim().toUpperCase();
-            const valJabatan = String(row[idxJabatan] || "").trim().toUpperCase();
-            return valCabang === targetCabangUpper && valJabatan === targetJabatanUpper;
-        });
+        if (!isFinalApproved) {
+            const matchRowsCabang = rowsCabang.slice(1).filter(row => {
+                const valCabang = String(row[idxCabang] || "").trim().toUpperCase();
+                const valJabatan = String(row[idxJabatan] || "").trim().toUpperCase();
+                return valCabang === targetCabangUpper && valJabatan === targetJabatanUpper;
+            });
 
-        if (matchRowsCabang.length === 0) {
-            return res.status(404).json({ error: `Jabatan ${targetJabatan} tidak ditemukan di cabang ${cabang}.` });
+            if (matchRowsCabang.length === 0) {
+                return res.status(404).json({ error: `Jabatan ${targetJabatan} tidak ditemukan di cabang ${cabang}.` });
+            }
+
+            recipientEmailsArray = matchRowsCabang
+                .map(row => String(row[idxEmail] || "").trim())
+                .filter(email => email !== "");
+        } else {
+            const allowedJabatan = new Set([
+                'BRANCH BUILDING COORDINATOR',
+                'BRANCH BUILDING & MAINTENANCE MANAGER',
+            ]);
+
+            const cabangTeamEmails = rowsCabang.slice(1)
+                .filter(row => {
+                    const valCabang = String(row[idxCabang] || "").trim().toUpperCase();
+                    const valJabatan = String(row[idxJabatan] || "").trim().toUpperCase();
+                    return valCabang === targetCabangUpper && allowedJabatan.has(valJabatan);
+                })
+                .map(row => String(row[idxEmail] || "").trim())
+                .filter(Boolean);
+
+            recipientEmailsArray = [
+                String(emailPembuat || '').trim(),
+                String(emailKoord_old || '').trim(),
+                String(emailManager_old || '').trim(),
+                ...cabangTeamEmails,
+            ].filter(Boolean);
         }
 
-        // Kumpulkan semua email valid ke dalam Array, lalu gabungkan dengan koma
-        const recipientEmailsArray = matchRowsCabang
-            .map(row => String(row[idxEmail] || "").trim())
-            .filter(email => email !== ""); // Buang kalau ada cell email yang kosong
+        recipientEmailsArray = [...new Set(recipientEmailsArray)];
 
         if (recipientEmailsArray.length === 0) {
             return res.status(404).json({ error: `Email tujuan ditemukan tapi datanya kosong di sheet Cabang.` });
@@ -389,7 +449,7 @@ app.post('/api/resend-email', async (req, res) => {
         console.log(`[API] Email tujuan ditemukan (${recipientEmailsArray.length} orang): ${recipientEmailsStr} (${role})`);
 
         const approverForLink = recipientEmailsArray[0];
-        const encodedApprover = encodeURIComponent(approverForLink);
+        const encodedApprover = encodeURIComponent(approverForLink || '');
         const approvalUrl = `${SPARTA_BACKEND_BASE_URL}/api/handle_rab_approval?action=approve&row=${sheetRowNumber}&level=${approvalLevel}&approver=${encodedApprover}`;
         const rejectionUrl = `${SPARTA_BACKEND_BASE_URL}/api/reject_form/rab?row=${sheetRowNumber}&level=${approvalLevel}&approver=${encodedApprover}`;
 
@@ -418,43 +478,97 @@ app.post('/api/resend-email', async (req, res) => {
         }
 
         // --- STEP E: Kirim Email via GMAIL API ---
-        const mailOptions = {
-            from: `"Sparta System" <${getEnvValue('EMAIL_USER')}>`,
-            to: recipientEmailsStr, // <-- Menggunakan gabungan koma
-            subject: approvalLevel === 'coordinator'
-                ? `[TAHAP 1: PERLU PERSETUJUAN] RAB Proyek ${proyek} - ${rowLingkup}`
-                : `[TAHAP 2: PERLU PERSETUJUAN] RAB Proyek ${proyek} - ${rowLingkup}`,
-            html: buildRabApprovalEmailHtml({
-                level: role,
+        const fromAddress = `"Sparta System" <${getEnvValue('EMAIL_USER')}>`;
+
+        async function sendMailViaGmail(mailOptions) {
+            const mail = new MailComposer(mailOptions);
+            const messageBuffer = await mail.compile().build();
+
+            const encodedMessage = messageBuffer.toString('base64')
+                .replace(/\+/g, '-')
+                .replace(/\//g, '_')
+                .replace(/=+$/, '');
+
+            const result = await gmail.users.messages.send({
+                userId: 'me',
+                requestBody: { raw: encodedMessage }
+            });
+
+            console.log(`[Email] Sukses terkirim via Gmail API. ID: ${result.data.id}`);
+            return result.data.id;
+        }
+
+        let sentMessageIds = [];
+
+        if (isFinalApproved) {
+            const subject = `[FINAL - DISETUJUI] Pengajuan RAB Proyek ${namaToko}: ${proyek} - ${rowLingkup}`;
+            const baseBody = buildRabFinalApprovedEmailHtml({
+                namaToko,
                 proyek,
-                nomorUlok: rowUlok,
-                approvalUrl,
-                rejectionUrl,
-                additionalInfo,
-            }),
-            attachments: attachments
-        };
+                lingkup: rowLingkup,
+                pdfNonSboFilename: 'RAB_NON_SBO.pdf',
+                pdfRekapFilename: 'REKAP_RAB.pdf',
+                linkPdfNonSbo: linkPdfNonSbo,
+                linkPdfRekap: linkPdfRekap,
+            });
 
-        const mail = new MailComposer(mailOptions);
-        const messageBuffer = await mail.compile().build();
+            const kontraktorEmail = String(emailPembuat || '').trim();
+            const teamRecipients = recipientEmailsArray.filter(email => {
+                if (!kontraktorEmail) return true;
+                return email.toLowerCase() !== kontraktorEmail.toLowerCase();
+            });
 
-        const encodedMessage = messageBuffer.toString('base64')
-            .replace(/\+/g, '-')
-            .replace(/\//g, '_')
-            .replace(/=+$/, '');
+            if (kontraktorEmail) {
+                const kontraktorMessageId = await sendMailViaGmail({
+                    from: fromAddress,
+                    to: kontraktorEmail,
+                    subject,
+                    html: buildRabFinalApprovedKontraktorHtml(baseBody),
+                    attachments,
+                });
+                sentMessageIds.push(kontraktorMessageId);
+            }
 
-        const result = await gmail.users.messages.send({
-            userId: 'me',
-            requestBody: { raw: encodedMessage }
-        });
+            if (teamRecipients.length > 0) {
+                const teamMessageId = await sendMailViaGmail({
+                    from: fromAddress,
+                    to: teamRecipients.join(', '),
+                    subject,
+                    html: baseBody,
+                    attachments,
+                });
+                sentMessageIds.push(teamMessageId);
+            }
 
-        console.log(`[Email] Sukses terkirim via Gmail API. ID: ${result.data.id}`);
+            if (sentMessageIds.length === 0) {
+                return res.status(404).json({ error: 'Tidak ada penerima final yang valid untuk status Disetujui.' });
+            }
+        } else {
+            const singleMessageId = await sendMailViaGmail({
+                from: fromAddress,
+                to: recipientEmailsStr,
+                subject: approvalLevel === 'coordinator'
+                    ? `[TAHAP 1: PERLU PERSETUJUAN] RAB Proyek ${proyek} - ${rowLingkup}`
+                    : `[TAHAP 2: PERLU PERSETUJUAN] RAB Proyek ${proyek} - ${rowLingkup}`,
+                html: buildRabApprovalEmailHtml({
+                    level: role,
+                    proyek,
+                    nomorUlok: rowUlok,
+                    approvalUrl,
+                    rejectionUrl,
+                    additionalInfo,
+                }),
+                attachments,
+            });
+            sentMessageIds.push(singleMessageId);
+        }
 
         return res.status(200).json({
             message: 'Email berhasil dikirim.',
             recipient: recipientEmailsStr,
             role: role,
-            messageId: result.data.id
+            messageId: sentMessageIds[0],
+            messageIds: sentMessageIds
         });
 
     } catch (error) {
