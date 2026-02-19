@@ -21,7 +21,6 @@ docOAuth2Client.setCredentials({ refresh_token: process.env.DOC_GOOGLE_REFRESH_T
 const sheets = google.sheets({ version: 'v4', auth: docOAuth2Client });
 const drive = google.drive({ version: 'v3', auth: docOAuth2Client });
 
-
 // ==============================================================================
 // 2. Setup OAuth2 Client KHUSUS untuk Kirim Email Gmail (Pakai GOOGLE_ credentials)
 // ==============================================================================
@@ -31,7 +30,6 @@ const mailOAuth2Client = new google.auth.OAuth2(
     "https://developers.google.com/oauthplayground"
 );
 mailOAuth2Client.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN });
-
 
 function extractFileId(url) {
     if (!url) return null;
@@ -71,56 +69,103 @@ app.post('/api/resend-email', async (req, res) => {
         console.log(`[API] Memproses Ulok: ${ulok}, Lingkup: ${lingkup}...`);
 
         const sheetId = process.env.DOC_SHEET_ID;
-        const response = await sheets.spreadsheets.values.get({
+
+        // -------------------------------------------------------------
+        // STEP A: AMBIL DATA DARI form2 UNTUK CEK STATUS & CABANG
+        // -------------------------------------------------------------
+        const responseForm2 = await sheets.spreadsheets.values.get({
             spreadsheetId: sheetId,
             range: 'form2!A:O',
         });
 
-        const rows = response.data.values;
-        if (!rows || rows.length === 0) {
-            return res.status(404).json({ error: 'Data tidak ditemukan di Google Sheet.' });
+        const rowsForm2 = responseForm2.data.values;
+        if (!rowsForm2 || rowsForm2.length === 0) {
+            return res.status(404).json({ error: 'Data tidak ditemukan di Google Sheet (form2).' });
         }
 
         const normalizedTargetUlok = normalizeString(ulok);
         const normalizedTargetLingkup = String(lingkup).trim().toLowerCase();
 
-        // Cari baris menggunakan INDEX YANG BENAR: Ulok (Index 9) & Lingkup (Index 13)
-        const targetRow = rows.slice(1).find(row => {
+        // Cari baris menggunakan INDEX: Ulok (Index 9) & Lingkup (Index 13)
+        const targetRow = rowsForm2.slice(1).find(row => {
             const rowUlok = normalizeString(row[9]);
             const rowLingkup = String(row[13] || "").trim().toLowerCase();
-
             return rowUlok === normalizedTargetUlok && rowLingkup === normalizedTargetLingkup;
         });
 
         if (!targetRow) {
-            return res.status(404).json({ error: 'Data dengan Ulok dan Lingkup Pekerjaan tersebut tidak ditemukan.' });
+            return res.status(404).json({ error: 'Data dengan Ulok dan Lingkup Pekerjaan tersebut tidak ditemukan di form2.' });
         }
 
-        // Mapping index kolom TANPA variabel "nomor" yang bikin salah urutan
         const [
             status, timestamp, linkPdf, linkPdfNonSbo,
-            emailKoord, waktuKoord, emailManager, waktuManager,
+            emailKoord_old, waktuKoord, emailManager_old, waktuManager,
             emailPembuat, rowUlok, proyek, alamat, cabang, rowLingkup
         ] = targetRow;
 
-        let recipientEmail = '';
+        // -------------------------------------------------------------
+        // STEP B: TENTUKAN TARGET JABATAN BERDASARKAN STATUS
+        // -------------------------------------------------------------
         let role = '';
+        let targetJabatan = '';
 
         if (status === 'Menunggu Persetujuan Koordinator') {
-            recipientEmail = emailKoord;
             role = 'Koordinator';
+            targetJabatan = 'BRANCH BUILDING COORDINATOR';
         } else if (status === 'Menunggu Persetujuan Manager') {
-            recipientEmail = emailManager;
             role = 'Manager';
+            targetJabatan = 'BRANCH BUILDING & MAINTENANCE MANAGER';
         } else {
             return res.status(200).json({ message: `Email tidak dikirim. Status saat ini: "${status}"` });
         }
 
-        if (!recipientEmail) {
-            return res.status(400).json({ error: `Email ${role} kosong di Sheet.` });
+        if (!cabang) {
+            return res.status(400).json({ error: 'Kolom cabang di form2 kosong, tidak bisa mencari email tujuan.' });
         }
 
-        // Download PDF Attachments dari Drive (Pakai DOC_ Client)
+        // -------------------------------------------------------------
+        // STEP C: CARI EMAIL DI SHEET "Cabang"
+        // -------------------------------------------------------------
+        const responseCabang = await sheets.spreadsheets.values.get({
+            spreadsheetId: sheetId,
+            range: 'Cabang!A:Z', // Ambil range lebar agar header pasti terbaca
+        });
+
+        const rowsCabang = responseCabang.data.values;
+        if (!rowsCabang || rowsCabang.length === 0) {
+            return res.status(404).json({ error: 'Sheet Cabang kosong atau tidak ditemukan.' });
+        }
+
+        // Cari indeks kolom secara dinamis dari header (Baris 1)
+        const headersCabang = rowsCabang[0].map(h => String(h).trim().toUpperCase());
+        const idxCabang = headersCabang.indexOf('CABANG');
+        const idxJabatan = headersCabang.indexOf('JABATAN');
+        const idxEmail = headersCabang.indexOf('EMAIL_SAT');
+
+        if (idxCabang === -1 || idxJabatan === -1 || idxEmail === -1) {
+            return res.status(500).json({ error: 'Format header di sheet Cabang salah. Pastikan ada kolom CABANG, JABATAN, dan EMAIL_SAT.' });
+        }
+
+        // Cocokkan Cabang dan Jabatan
+        const targetCabangUpper = String(cabang).trim().toUpperCase();
+        const targetJabatanUpper = targetJabatan.toUpperCase();
+
+        const matchRowCabang = rowsCabang.slice(1).find(row => {
+            const valCabang = String(row[idxCabang] || "").trim().toUpperCase();
+            const valJabatan = String(row[idxJabatan] || "").trim().toUpperCase();
+            return valCabang === targetCabangUpper && valJabatan === targetJabatanUpper;
+        });
+
+        if (!matchRowCabang || !matchRowCabang[idxEmail]) {
+            return res.status(404).json({ error: `Gagal mengirim. Email untuk jabatan ${targetJabatan} di cabang ${cabang} tidak ditemukan di sheet Cabang.` });
+        }
+
+        const recipientEmail = String(matchRowCabang[idxEmail]).trim();
+        console.log(`[API] Email tujuan ditemukan: ${recipientEmail} (${role} - ${cabang})`);
+
+        // -------------------------------------------------------------
+        // STEP D: DOWNLOAD PDF & KIRIM EMAIL
+        // -------------------------------------------------------------
         const attachments = [];
         const pdfId = extractFileId(linkPdf);
         const pdfNonSboId = extractFileId(linkPdfNonSbo);
@@ -135,7 +180,6 @@ app.post('/api/resend-email', async (req, res) => {
             if (pdfNonSboBuffer) attachments.push({ filename: 'RAB_NON_SBO.pdf', content: pdfNonSboBuffer });
         }
 
-        // Setup Nodemailer dengan Gmail OAuth2 (Pakai GOOGLE_ Client)
         const accessToken = await mailOAuth2Client.getAccessToken();
         const transporter = nodemailer.createTransport({
             service: 'gmail',
@@ -149,7 +193,6 @@ app.post('/api/resend-email', async (req, res) => {
             },
         });
 
-        // Kirim Email
         const mailOptions = {
             from: `"Sparta System" <${process.env.EMAIL_USER}>`,
             to: recipientEmail,
