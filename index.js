@@ -1,6 +1,8 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const fs = require('fs');
+const path = require('path');
 const { google } = require('googleapis');
 const MailComposer = require('nodemailer/lib/mail-composer');
 
@@ -8,16 +10,97 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+function getEnvValue(name) {
+    const raw = process.env[name];
+    if (!raw) return '';
+
+    let value = String(raw).trim();
+
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+        value = value.slice(1, -1).trim();
+    }
+
+    const prefixedKey = `${name}=`;
+    if (value.startsWith(prefixedKey)) {
+        value = value.slice(prefixedKey.length).trim();
+    }
+
+    return value;
+}
+
+function findSecretFile(fileName) {
+    const candidates = [
+        path.join('/etc/secrets', fileName),
+        path.join(process.cwd(), fileName),
+        path.join(__dirname, fileName),
+        path.join(process.cwd(), 'server', fileName),
+    ];
+
+    return candidates.find((filePath) => fs.existsSync(filePath)) || null;
+}
+
+function readAuthorizedUserToken(fileName) {
+    const tokenPath = findSecretFile(fileName);
+    if (!tokenPath) return { tokenData: null, tokenPath: null };
+
+    try {
+        const raw = fs.readFileSync(tokenPath, 'utf8');
+        const parsed = JSON.parse(raw);
+        return { tokenData: parsed, tokenPath };
+    } catch (error) {
+        console.warn(`[Auth] Gagal parse token file ${tokenPath}: ${error.message}`);
+        return { tokenData: null, tokenPath };
+    }
+}
+
+function buildOAuthClient(config) {
+    const {
+        label,
+        tokenFileName,
+        envClientIdKey,
+        envClientSecretKey,
+        envRefreshTokenKey,
+    } = config;
+
+    const { tokenData, tokenPath } = readAuthorizedUserToken(tokenFileName);
+
+    const clientId = tokenData?.client_id || getEnvValue(envClientIdKey);
+    const clientSecret = tokenData?.client_secret || getEnvValue(envClientSecretKey);
+    const refreshToken = tokenData?.refresh_token || getEnvValue(envRefreshTokenKey);
+
+    if (!clientId || !clientSecret || !refreshToken) {
+        throw new Error(`[Auth] Kredensial ${label} tidak lengkap. Cek ${tokenFileName} atau env ${envClientIdKey}/${envClientSecretKey}/${envRefreshTokenKey}.`);
+    }
+
+    const oauthClient = new google.auth.OAuth2(
+        clientId,
+        clientSecret,
+        'https://developers.google.com/oauthplayground'
+    );
+    oauthClient.setCredentials({ refresh_token: refreshToken });
+
+    return {
+        client: oauthClient,
+        meta: {
+            source: tokenData ? `file:${tokenPath}` : `env:${envRefreshTokenKey}`,
+            tokenFileFound: Boolean(tokenPath),
+            hasRefreshToken: Boolean(refreshToken),
+        }
+    };
+}
+
 // ==============================================================================
 // 1. KREDENSIAL "DOC" -> KHUSUS MEMBACA SHEETS DAN DOWNLOAD DRIVE
 // Karena Sparta simpan PDF-nya pakai kredensial DOC, downloadnya wajib pakai DOC
 // ==============================================================================
-const docOAuth2Client = new google.auth.OAuth2(
-    process.env.DOC_GOOGLE_CLIENT_ID,
-    process.env.DOC_GOOGLE_CLIENT_SECRET,
-    "https://developers.google.com/oauthplayground"
-);
-docOAuth2Client.setCredentials({ refresh_token: process.env.DOC_GOOGLE_REFRESH_TOKEN });
+const docAuth = buildOAuthClient({
+    label: 'DOC',
+    tokenFileName: 'token_doc.json',
+    envClientIdKey: 'DOC_GOOGLE_CLIENT_ID',
+    envClientSecretKey: 'DOC_GOOGLE_CLIENT_SECRET',
+    envRefreshTokenKey: 'DOC_GOOGLE_REFRESH_TOKEN',
+});
+const docOAuth2Client = docAuth.client;
 
 const sheets = google.sheets({ version: 'v4', auth: docOAuth2Client });
 const drive = google.drive({ version: 'v3', auth: docOAuth2Client }); // <-- KEMBALI PAKAI DOC
@@ -26,15 +109,20 @@ const drive = google.drive({ version: 'v3', auth: docOAuth2Client }); // <-- KEM
 // ==============================================================================
 // 2. KREDENSIAL "UTAMA" -> KHUSUS UNTUK GMAIL API (KIRIM EMAIL)
 // ==============================================================================
-const spartaOAuth2Client = new google.auth.OAuth2(
-    process.env.GOOGLE_CLIENT_ID,
-    process.env.GOOGLE_CLIENT_SECRET,
-    "https://developers.google.com/oauthplayground"
-);
-spartaOAuth2Client.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN });
+const spartaAuth = buildOAuthClient({
+    label: 'SPARTA',
+    tokenFileName: 'token.json',
+    envClientIdKey: 'GOOGLE_CLIENT_ID',
+    envClientSecretKey: 'GOOGLE_CLIENT_SECRET',
+    envRefreshTokenKey: 'GOOGLE_REFRESH_TOKEN',
+});
+const spartaOAuth2Client = spartaAuth.client;
 
 const gmail = google.gmail({ version: 'v1', auth: spartaOAuth2Client });
 const spartaDrive = google.drive({ version: 'v3', auth: spartaOAuth2Client });
+
+console.log(`[Auth] DOC source: ${docAuth.meta.source}`);
+console.log(`[Auth] SPARTA source: ${spartaAuth.meta.source}`);
 
 // --- Helper Functions ---
 function extractFileId(url) {
@@ -87,6 +175,58 @@ function normalizeString(str) {
     if (!str) return "";
     return String(str).replace(/-/g, "").replace(/\s/g, "").trim().toUpperCase();
 }
+
+async function getClientScopeInfo(oauthClient) {
+    try {
+        const accessToken = await oauthClient.getAccessToken();
+        const tokenValue = typeof accessToken === 'string' ? accessToken : accessToken?.token;
+        if (!tokenValue) {
+            return { ok: false, message: 'Tidak bisa mengambil access token.', scopes: [] };
+        }
+
+        const info = await oauthClient.getTokenInfo(tokenValue);
+        const scopes = Array.isArray(info?.scopes)
+            ? info.scopes
+            : String(info?.scope || '')
+                .split(' ')
+                .map(s => s.trim())
+                .filter(Boolean);
+
+        return { ok: true, message: 'OK', scopes };
+    } catch (error) {
+        return {
+            ok: false,
+            message: error.message,
+            scopes: []
+        };
+    }
+}
+
+app.get('/api/debug/oauth-clients', async (req, res) => {
+    try {
+        const [docScopeInfo, spartaScopeInfo] = await Promise.all([
+            getClientScopeInfo(docOAuth2Client),
+            getClientScopeInfo(spartaOAuth2Client),
+        ]);
+
+        return res.status(200).json({
+            doc: {
+                source: docAuth.meta.source,
+                tokenFileFound: docAuth.meta.tokenFileFound,
+                hasRefreshToken: docAuth.meta.hasRefreshToken,
+                scopeInfo: docScopeInfo,
+            },
+            sparta: {
+                source: spartaAuth.meta.source,
+                tokenFileFound: spartaAuth.meta.tokenFileFound,
+                hasRefreshToken: spartaAuth.meta.hasRefreshToken,
+                scopeInfo: spartaScopeInfo,
+            },
+        });
+    } catch (error) {
+        return res.status(500).json({ error: 'Gagal membaca status OAuth client.', details: error.message });
+    }
+});
 
 // === ENDPOINT API ===
 app.post('/api/resend-email', async (req, res) => {
@@ -201,7 +341,7 @@ app.post('/api/resend-email', async (req, res) => {
 
         // --- STEP E: Kirim Email via GMAIL API ---
         const mailOptions = {
-            from: `"Sparta System" <${process.env.EMAIL_USER}>`,
+            from: `"Sparta System" <${getEnvValue('EMAIL_USER')}>`,
             to: recipientEmailsStr, // <-- Menggunakan gabungan koma
             subject: `[REMINDER] Persetujuan RAB - ${proyek} - Cabang ${cabang}`,
             html: `
