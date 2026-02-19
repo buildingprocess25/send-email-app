@@ -9,41 +9,78 @@ app.use(cors());
 app.use(express.json());
 
 // ==============================================================================
-// KREDENSIAL UTAMA (SPARTA) -> Akses Sheets, Drive (PDF_STORAGE), & Gmail
+// 1. KREDENSIAL "DOC" -> KHUSUS MEMBACA SHEETS DAN DOWNLOAD DRIVE
+// Karena Sparta simpan PDF-nya pakai kredensial DOC, downloadnya wajib pakai DOC
+// ==============================================================================
+const docOAuth2Client = new google.auth.OAuth2(
+    process.env.DOC_GOOGLE_CLIENT_ID,
+    process.env.DOC_GOOGLE_CLIENT_SECRET,
+    "https://developers.google.com/oauthplayground"
+);
+docOAuth2Client.setCredentials({ refresh_token: process.env.DOC_GOOGLE_REFRESH_TOKEN });
+
+const sheets = google.sheets({ version: 'v4', auth: docOAuth2Client });
+const drive = google.drive({ version: 'v3', auth: docOAuth2Client }); // <-- KEMBALI PAKAI DOC
+
+
+// ==============================================================================
+// 2. KREDENSIAL "UTAMA" -> KHUSUS UNTUK GMAIL API (KIRIM EMAIL)
 // ==============================================================================
 const spartaOAuth2Client = new google.auth.OAuth2(
     process.env.GOOGLE_CLIENT_ID,
     process.env.GOOGLE_CLIENT_SECRET,
     "https://developers.google.com/oauthplayground"
 );
-// PENTING: GOOGLE_REFRESH_TOKEN di Render harus sama dengan yang di token.json
 spartaOAuth2Client.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN });
 
-// Semua layanan Google sekarang hanya pakai 1 kredensial utama
-const sheets = google.sheets({ version: 'v4', auth: spartaOAuth2Client });
-const drive = google.drive({ version: 'v3', auth: spartaOAuth2Client });
 const gmail = google.gmail({ version: 'v1', auth: spartaOAuth2Client });
+const spartaDrive = google.drive({ version: 'v3', auth: spartaOAuth2Client });
 
 // --- Helper Functions ---
 function extractFileId(url) {
     if (!url) return null;
-    const match = url.match(/(?:id=|d\/|file\/d\/)([\w-]{25,})/);
+    const text = String(url).trim();
+
+    if (/^[\w-]{20,}$/.test(text)) {
+        return text;
+    }
+
+    const match = text.match(/(?:id=|\/d\/|file\/d\/)([\w-]{20,})/);
     return match ? match[1] : null;
+}
+
+async function downloadDriveFileWithClient(driveClient, fileId, label) {
+    try {
+        await driveClient.files.get({
+            fileId,
+            fields: 'id,name,mimeType',
+            supportsAllDrives: true,
+        });
+
+        const response = await driveClient.files.get(
+            { fileId, alt: 'media', supportsAllDrives: true },
+            { responseType: 'arraybuffer' }
+        );
+        console.log(`[Drive] Berhasil mengunduh ID: ${fileId} via ${label}`);
+        return Buffer.from(response.data);
+    } catch (error) {
+        const status = error?.response?.status;
+        console.warn(`[Drive] Gagal via ${label} untuk ID ${fileId}: ${status || ''} ${error.message}`.trim());
+        return null;
+    }
 }
 
 async function downloadDriveFile(fileId) {
     if (!fileId) return null;
-    try {
-        const response = await drive.files.get(
-            { fileId: fileId, alt: 'media' },
-            { responseType: 'arraybuffer' }
-        );
-        console.log(`[Drive] Berhasil mengunduh ID: ${fileId}`);
-        return Buffer.from(response.data);
-    } catch (error) {
-        console.error(`[Drive] Gagal mengunduh file ID ${fileId}:`, error.message);
-        return null;
-    }
+
+    const fromDoc = await downloadDriveFileWithClient(drive, fileId, 'DOC');
+    if (fromDoc) return fromDoc;
+
+    const fromSparta = await downloadDriveFileWithClient(spartaDrive, fileId, 'SPARTA');
+    if (fromSparta) return fromSparta;
+
+    console.error(`[Drive] Gagal mengunduh file ID ${fileId} pada semua kredensial.`);
+    return null;
 }
 
 function normalizeString(str) {
@@ -62,12 +99,7 @@ app.post('/api/resend-email', async (req, res) => {
     try {
         console.log(`[API] Memproses Ulok: ${ulok}, Lingkup: ${lingkup}...`);
 
-        // SEKARANG MENGGUNAKAN SPREADSHEET_ID UTAMA
-        const sheetId = process.env.SPREADSHEET_ID;
-
-        if (!sheetId) {
-            return res.status(500).json({ error: 'SPREADSHEET_ID tidak ditemukan di environment variables.' });
-        }
+        const sheetId = process.env.DOC_SHEET_ID;
 
         // --- STEP A: Cari Data di form2 ---
         const responseForm2 = await sheets.spreadsheets.values.get({
@@ -111,7 +143,7 @@ app.post('/api/resend-email', async (req, res) => {
 
         if (!cabang) return res.status(400).json({ error: 'Kolom cabang kosong.' });
 
-        // --- STEP C: Cari BANYAK Email di Sheet Cabang ---
+        // --- STEP C: Cari BANYAK Email di Sheet Cabang (Menggunakan .filter) ---
         const responseCabang = await sheets.spreadsheets.values.get({
             spreadsheetId: sheetId,
             range: 'Cabang!A:Z',
@@ -128,6 +160,7 @@ app.post('/api/resend-email', async (req, res) => {
         const targetCabangUpper = String(cabang).trim().toUpperCase();
         const targetJabatanUpper = targetJabatan.toUpperCase();
 
+        // Gunakan .filter() untuk mencari SEMUA baris yang cocok
         const matchRowsCabang = rowsCabang.slice(1).filter(row => {
             const valCabang = String(row[idxCabang] || "").trim().toUpperCase();
             const valJabatan = String(row[idxJabatan] || "").trim().toUpperCase();
@@ -138,19 +171,21 @@ app.post('/api/resend-email', async (req, res) => {
             return res.status(404).json({ error: `Jabatan ${targetJabatan} tidak ditemukan di cabang ${cabang}.` });
         }
 
+        // Kumpulkan semua email valid ke dalam Array, lalu gabungkan dengan koma
         const recipientEmailsArray = matchRowsCabang
             .map(row => String(row[idxEmail] || "").trim())
-            .filter(email => email !== "");
+            .filter(email => email !== ""); // Buang kalau ada cell email yang kosong
 
         if (recipientEmailsArray.length === 0) {
             return res.status(404).json({ error: `Email tujuan ditemukan tapi datanya kosong di sheet Cabang.` });
         }
 
+        // Format akhirnya jadi: "email1@gmail.com, email2@gmail.com"
         const recipientEmailsStr = recipientEmailsArray.join(', ');
         console.log(`[API] Email tujuan ditemukan (${recipientEmailsArray.length} orang): ${recipientEmailsStr} (${role})`);
 
 
-        // --- STEP D: Download PDF (Sekarang 100% pakai Auth Utama) ---
+        // --- STEP D: Download PDF (Sekarang pakai DOC Auth) ---
         const attachments = [];
         const pdfId = extractFileId(linkPdf);
         const pdfNonSboId = extractFileId(linkPdfNonSbo);
@@ -167,7 +202,7 @@ app.post('/api/resend-email', async (req, res) => {
         // --- STEP E: Kirim Email via GMAIL API ---
         const mailOptions = {
             from: `"Sparta System" <${process.env.EMAIL_USER}>`,
-            to: recipientEmailsStr,
+            to: recipientEmailsStr, // <-- Menggunakan gabungan koma
             subject: `[REMINDER] Persetujuan RAB - ${proyek} - Cabang ${cabang}`,
             html: `
                 <h3>Halo,</h3>
