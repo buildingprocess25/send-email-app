@@ -84,10 +84,10 @@ app.post('/api/resend-email', async (req, res) => {
         const normalizedTargetUlok = normalizeString(ulok);
         const normalizedTargetLingkup = String(lingkup).trim().toLowerCase();
 
-        // Cari baris dengan membandingkan data yang sudah dinormalisasi
+        // Cari baris menggunakan INDEX YANG BENAR: Ulok (Index 9) & Lingkup (Index 13)
         const targetRow = rows.slice(1).find(row => {
-            const rowUlok = normalizeString(row[10]);
-            const rowLingkup = String(row[14] || "").trim().toLowerCase();
+            const rowUlok = normalizeString(row[9]);
+            const rowLingkup = String(row[13] || "").trim().toLowerCase();
 
             return rowUlok === normalizedTargetUlok && rowLingkup === normalizedTargetLingkup;
         });
@@ -96,10 +96,11 @@ app.post('/api/resend-email', async (req, res) => {
             return res.status(404).json({ error: 'Data dengan Ulok dan Lingkup Pekerjaan tersebut tidak ditemukan.' });
         }
 
+        // Mapping index kolom TANPA variabel "nomor" yang bikin salah urutan
         const [
             status, timestamp, linkPdf, linkPdfNonSbo,
             emailKoord, waktuKoord, emailManager, waktuManager,
-            emailPembuat, nomor, rowUlok, proyek, alamat, cabang, rowLingkup
+            emailPembuat, rowUlok, proyek, alamat, cabang, rowLingkup
         ] = targetRow;
 
         let recipientEmail = '';
