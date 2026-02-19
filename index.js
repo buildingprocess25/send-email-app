@@ -298,11 +298,12 @@ app.post('/api/resend-email', async (req, res) => {
         // --- STEP A: Cari Data di form2 ---
         const responseForm2 = await sheets.spreadsheets.values.get({
             spreadsheetId: sheetId,
-            range: 'form2!A:O',
+            range: 'form2!A:AA',
         });
 
         const rowsForm2 = responseForm2.data.values;
         if (!rowsForm2 || rowsForm2.length === 0) return res.status(404).json({ error: 'Data form2 kosong.' });
+        const headersForm2 = rowsForm2[0].map(h => String(h || '').trim().toUpperCase());
 
         const normalizedTargetUlok = normalizeString(ulok);
         const normalizedTargetLingkup = String(lingkup).trim().toLowerCase();
@@ -324,6 +325,8 @@ app.post('/api/resend-email', async (req, res) => {
             emailKoord_old, waktuKoord, emailManager_old, waktuManager,
             emailPembuat, rowUlok, proyek, alamat, cabang, rowLingkup
         ] = targetRow;
+        const idxLinkPdfRekap = headersForm2.indexOf('LINK PDF REKAPITULASI');
+        const linkPdfRekap = idxLinkPdfRekap >= 0 ? targetRow[idxLinkPdfRekap] : targetRow[25];
 
         // --- STEP B: Tentukan Role ---
         let role = '';
@@ -399,6 +402,7 @@ app.post('/api/resend-email', async (req, res) => {
         const attachments = [];
         const pdfId = extractFileId(linkPdf);
         const pdfNonSboId = extractFileId(linkPdfNonSbo);
+        const pdfRekapId = extractFileId(linkPdfRekap);
 
         if (pdfId) {
             const pdfBuffer = await downloadDriveFile(pdfId);
@@ -407,6 +411,10 @@ app.post('/api/resend-email', async (req, res) => {
         if (pdfNonSboId) {
             const pdfNonSboBuffer = await downloadDriveFile(pdfNonSboId);
             if (pdfNonSboBuffer) attachments.push({ filename: 'RAB_NON_SBO.pdf', content: pdfNonSboBuffer });
+        }
+        if (pdfRekapId) {
+            const pdfRekapBuffer = await downloadDriveFile(pdfRekapId);
+            if (pdfRekapBuffer) attachments.push({ filename: 'REKAP_RAB.pdf', content: pdfRekapBuffer });
         }
 
         // --- STEP E: Kirim Email via GMAIL API ---
