@@ -9,7 +9,7 @@ app.use(cors());
 app.use(express.json());
 
 // ==============================================================================
-// 1. Setup OAuth2 Client KHUSUS untuk Google Sheets & Drive (Pakai DOC_ credentials)
+// 1. Setup OAuth2 Client untuk SHEETS (Tetap pakai DOC_ jika sheetnya ada di sana)
 // ==============================================================================
 const docOAuth2Client = new google.auth.OAuth2(
     process.env.DOC_GOOGLE_CLIENT_ID,
@@ -19,10 +19,10 @@ const docOAuth2Client = new google.auth.OAuth2(
 docOAuth2Client.setCredentials({ refresh_token: process.env.DOC_GOOGLE_REFRESH_TOKEN });
 
 const sheets = google.sheets({ version: 'v4', auth: docOAuth2Client });
-const drive = google.drive({ version: 'v3', auth: docOAuth2Client });
 
 // ==============================================================================
-// 2. Setup OAuth2 Client KHUSUS untuk Kirim Email Gmail (Pakai GOOGLE_ credentials)
+// 2. Setup OAuth2 Client UTAMA (Untuk Email & DRIVE)
+//    Kita pakai ini untuk Drive juga agar tidak error 404 saat download file
 // ==============================================================================
 const mailOAuth2Client = new google.auth.OAuth2(
     process.env.GOOGLE_CLIENT_ID,
@@ -30,6 +30,10 @@ const mailOAuth2Client = new google.auth.OAuth2(
     "https://developers.google.com/oauthplayground"
 );
 mailOAuth2Client.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN });
+
+// Pakai auth utama untuk Drive
+const drive = google.drive({ version: 'v3', auth: mailOAuth2Client });
+
 
 function extractFileId(url) {
     if (!url) return null;
@@ -46,6 +50,7 @@ async function downloadDriveFile(fileId) {
         );
         return Buffer.from(response.data);
     } catch (error) {
+        // Log error tapi jangan biarkan aplikasi crash
         console.error(`Gagal mengunduh file ID ${fileId}:`, error.message);
         return null;
     }
@@ -128,7 +133,7 @@ app.post('/api/resend-email', async (req, res) => {
         // -------------------------------------------------------------
         const responseCabang = await sheets.spreadsheets.values.get({
             spreadsheetId: sheetId,
-            range: 'Cabang!A:Z', // Ambil range lebar agar header pasti terbaca
+            range: 'Cabang!A:Z',
         });
 
         const rowsCabang = responseCabang.data.values;
@@ -136,7 +141,6 @@ app.post('/api/resend-email', async (req, res) => {
             return res.status(404).json({ error: 'Sheet Cabang kosong atau tidak ditemukan.' });
         }
 
-        // Cari indeks kolom secara dinamis dari header (Baris 1)
         const headersCabang = rowsCabang[0].map(h => String(h).trim().toUpperCase());
         const idxCabang = headersCabang.indexOf('CABANG');
         const idxJabatan = headersCabang.indexOf('JABATAN');
@@ -146,7 +150,6 @@ app.post('/api/resend-email', async (req, res) => {
             return res.status(500).json({ error: 'Format header di sheet Cabang salah. Pastikan ada kolom CABANG, JABATAN, dan EMAIL_SAT.' });
         }
 
-        // Cocokkan Cabang dan Jabatan
         const targetCabangUpper = String(cabang).trim().toUpperCase();
         const targetJabatanUpper = targetJabatan.toUpperCase();
 
@@ -170,6 +173,7 @@ app.post('/api/resend-email', async (req, res) => {
         const pdfId = extractFileId(linkPdf);
         const pdfNonSboId = extractFileId(linkPdfNonSbo);
 
+        // Download file (sekarang pakai auth Utama, semoga 404 hilang)
         if (pdfId) {
             const pdfBuffer = await downloadDriveFile(pdfId);
             if (pdfBuffer) attachments.push({ filename: 'RAB_SBO.pdf', content: pdfBuffer });
@@ -181,8 +185,11 @@ app.post('/api/resend-email', async (req, res) => {
         }
 
         const accessToken = await mailOAuth2Client.getAccessToken();
+
+        // KONFIGURASI FIX IPV6: Tambahkan family: 4
         const transporter = nodemailer.createTransport({
             service: 'gmail',
+            family: 4, // <--- INI PENTING! Memaksa pakai IPv4
             auth: {
                 type: 'OAuth2',
                 user: process.env.EMAIL_USER,
