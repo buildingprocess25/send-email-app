@@ -337,7 +337,7 @@ app.post('/api/resend-email', async (req, res) => {
             role = 'Koordinator';
             targetJabatan = 'BRANCH BUILDING COORDINATOR';
             approvalLevel = 'coordinator';
-        } else if (status === 'Menunggu Persetujuan Manager') {
+        } else if (status === 'Menunggu Persetujuan Manajer') {
             role = 'Manager';
             targetJabatan = 'BRANCH BUILDING & MAINTENANCE MANAGER';
             approvalLevel = 'manager';
