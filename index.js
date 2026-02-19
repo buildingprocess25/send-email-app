@@ -9,30 +9,19 @@ app.use(cors());
 app.use(express.json());
 
 // ==============================================================================
-// 1. KREDENSIAL "DOC" -> KHUSUS MEMBACA SHEETS DAN DOWNLOAD DRIVE
-// Karena Sparta simpan PDF-nya pakai kredensial DOC, downloadnya wajib pakai DOC
-// ==============================================================================
-const docOAuth2Client = new google.auth.OAuth2(
-    process.env.DOC_GOOGLE_CLIENT_ID,
-    process.env.DOC_GOOGLE_CLIENT_SECRET,
-    "https://developers.google.com/oauthplayground"
-);
-docOAuth2Client.setCredentials({ refresh_token: process.env.DOC_GOOGLE_REFRESH_TOKEN });
-
-const sheets = google.sheets({ version: 'v4', auth: docOAuth2Client });
-const drive = google.drive({ version: 'v3', auth: docOAuth2Client }); // <-- KEMBALI PAKAI DOC
-
-
-// ==============================================================================
-// 2. KREDENSIAL "UTAMA" -> KHUSUS UNTUK GMAIL API (KIRIM EMAIL)
+// KREDENSIAL UTAMA (SPARTA) -> Akses Sheets, Drive (PDF_STORAGE), & Gmail
 // ==============================================================================
 const spartaOAuth2Client = new google.auth.OAuth2(
     process.env.GOOGLE_CLIENT_ID,
     process.env.GOOGLE_CLIENT_SECRET,
     "https://developers.google.com/oauthplayground"
 );
+// PENTING: GOOGLE_REFRESH_TOKEN di Render harus sama dengan yang di token.json
 spartaOAuth2Client.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN });
 
+// Semua layanan Google sekarang hanya pakai 1 kredensial utama
+const sheets = google.sheets({ version: 'v4', auth: spartaOAuth2Client });
+const drive = google.drive({ version: 'v3', auth: spartaOAuth2Client });
 const gmail = google.gmail({ version: 'v1', auth: spartaOAuth2Client });
 
 // --- Helper Functions ---
@@ -73,7 +62,12 @@ app.post('/api/resend-email', async (req, res) => {
     try {
         console.log(`[API] Memproses Ulok: ${ulok}, Lingkup: ${lingkup}...`);
 
-        const sheetId = process.env.DOC_SHEET_ID;
+        // SEKARANG MENGGUNAKAN SPREADSHEET_ID UTAMA
+        const sheetId = process.env.SPREADSHEET_ID;
+
+        if (!sheetId) {
+            return res.status(500).json({ error: 'SPREADSHEET_ID tidak ditemukan di environment variables.' });
+        }
 
         // --- STEP A: Cari Data di form2 ---
         const responseForm2 = await sheets.spreadsheets.values.get({
@@ -117,7 +111,7 @@ app.post('/api/resend-email', async (req, res) => {
 
         if (!cabang) return res.status(400).json({ error: 'Kolom cabang kosong.' });
 
-        // --- STEP C: Cari BANYAK Email di Sheet Cabang (Menggunakan .filter) ---
+        // --- STEP C: Cari BANYAK Email di Sheet Cabang ---
         const responseCabang = await sheets.spreadsheets.values.get({
             spreadsheetId: sheetId,
             range: 'Cabang!A:Z',
@@ -134,7 +128,6 @@ app.post('/api/resend-email', async (req, res) => {
         const targetCabangUpper = String(cabang).trim().toUpperCase();
         const targetJabatanUpper = targetJabatan.toUpperCase();
 
-        // Gunakan .filter() untuk mencari SEMUA baris yang cocok
         const matchRowsCabang = rowsCabang.slice(1).filter(row => {
             const valCabang = String(row[idxCabang] || "").trim().toUpperCase();
             const valJabatan = String(row[idxJabatan] || "").trim().toUpperCase();
@@ -145,21 +138,19 @@ app.post('/api/resend-email', async (req, res) => {
             return res.status(404).json({ error: `Jabatan ${targetJabatan} tidak ditemukan di cabang ${cabang}.` });
         }
 
-        // Kumpulkan semua email valid ke dalam Array, lalu gabungkan dengan koma
         const recipientEmailsArray = matchRowsCabang
             .map(row => String(row[idxEmail] || "").trim())
-            .filter(email => email !== ""); // Buang kalau ada cell email yang kosong
+            .filter(email => email !== "");
 
         if (recipientEmailsArray.length === 0) {
             return res.status(404).json({ error: `Email tujuan ditemukan tapi datanya kosong di sheet Cabang.` });
         }
 
-        // Format akhirnya jadi: "email1@gmail.com, email2@gmail.com"
         const recipientEmailsStr = recipientEmailsArray.join(', ');
         console.log(`[API] Email tujuan ditemukan (${recipientEmailsArray.length} orang): ${recipientEmailsStr} (${role})`);
 
 
-        // --- STEP D: Download PDF (Sekarang pakai DOC Auth) ---
+        // --- STEP D: Download PDF (Sekarang 100% pakai Auth Utama) ---
         const attachments = [];
         const pdfId = extractFileId(linkPdf);
         const pdfNonSboId = extractFileId(linkPdfNonSbo);
@@ -176,7 +167,7 @@ app.post('/api/resend-email', async (req, res) => {
         // --- STEP E: Kirim Email via GMAIL API ---
         const mailOptions = {
             from: `"Sparta System" <${process.env.EMAIL_USER}>`,
-            to: recipientEmailsStr, // <-- Menggunakan gabungan koma
+            to: recipientEmailsStr,
             subject: `[REMINDER] Persetujuan RAB - ${proyek} - Cabang ${cabang}`,
             html: `
                 <h3>Halo,</h3>
