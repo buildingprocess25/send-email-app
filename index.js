@@ -53,6 +53,12 @@ async function downloadDriveFile(fileId) {
     }
 }
 
+// Fungsi untuk menyamakan format Ulok (Hapus strip dan spasi)
+function normalizeString(str) {
+    if (!str) return "";
+    return String(str).replace(/-/g, "").replace(/\s/g, "").trim().toUpperCase();
+}
+
 // === ENDPOINT API ===
 app.post('/api/resend-email', async (req, res) => {
     const { ulok, lingkup } = req.body;
@@ -75,7 +81,16 @@ app.post('/api/resend-email', async (req, res) => {
             return res.status(404).json({ error: 'Data tidak ditemukan di Google Sheet.' });
         }
 
-        const targetRow = rows.slice(1).find(row => row[10] === ulok && row[14] === lingkup);
+        const normalizedTargetUlok = normalizeString(ulok);
+        const normalizedTargetLingkup = String(lingkup).trim().toLowerCase();
+
+        // Cari baris dengan membandingkan data yang sudah dinormalisasi
+        const targetRow = rows.slice(1).find(row => {
+            const rowUlok = normalizeString(row[10]);
+            const rowLingkup = String(row[14] || "").trim().toLowerCase();
+
+            return rowUlok === normalizedTargetUlok && rowLingkup === normalizedTargetLingkup;
+        });
 
         if (!targetRow) {
             return res.status(404).json({ error: 'Data dengan Ulok dan Lingkup Pekerjaan tersebut tidak ditemukan.' });
