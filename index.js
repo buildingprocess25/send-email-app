@@ -260,6 +260,83 @@ function buildRabFinalApprovedKontraktorHtml(baseBody) {
 <p><a href="https://materai-rab-pi.vercel.app/login" target="_blank">UPLOAD REKAP RAB TERMATERAI & SPH</a></p>`;
 }
 
+function buildDocApprovalEmailHtml({
+    docType,
+    level,
+    proyek,
+    nomorUlok,
+    approvalUrl,
+    rejectionUrl,
+    additionalInfo,
+}) {
+    const infoBlock = additionalInfo
+        ? `<p style="font-style: italic;">${escapeHtml(additionalInfo)}</p>`
+        : '';
+
+    return `
+<!DOCTYPE html>
+<html>
+<head>
+    <style>
+        .button { padding: 10px 20px; text-decoration: none; color: white !important; border-radius: 5px; }
+        .approve { background-color: #28a745; }
+        .reject { background-color: #dc3545; }
+    </style>
+</head>
+<body>
+    <p>Yth. Bapak/Ibu ${escapeHtml(level)},</p>
+    <p>
+        Dokumen ${escapeHtml(docType)} untuk proyek
+        <strong>${escapeHtml(proyek)}</strong>
+        dengan Nomor Ulok <strong>${escapeHtml(nomorUlok)}</strong>
+        memerlukan tinjauan dan persetujuan Anda.
+    </p>
+    ${infoBlock}
+    <p>Silakan periksa detailnya pada file PDF yang terlampir dan pilih tindakan di bawah ini:</p>
+    <br>
+    <a href="${approvalUrl}" class="button approve">SETUJUI</a>
+    <a href="${rejectionUrl}" class="button reject">TOLAK</a>
+    <br><br>
+    <p>Terima kasih.</p>
+    <p><em>--- Email ini dibuat secara otomatis.---</em></p>
+</body>
+</html>
+`;
+}
+
+function getHeaderIndex(headers, candidateNames) {
+    const normalized = headers.map(h => String(h || '').trim().toUpperCase());
+    for (const name of candidateNames) {
+        const idx = normalized.indexOf(String(name || '').trim().toUpperCase());
+        if (idx >= 0) return idx;
+    }
+    return -1;
+}
+
+function getCellByHeaders(row, headers, candidateNames, fallback = '') {
+    const idx = getHeaderIndex(headers, candidateNames);
+    if (idx < 0) return fallback;
+    return row[idx] ?? fallback;
+}
+
+async function sendMailViaGmail(mailOptions) {
+    const mail = new MailComposer(mailOptions);
+    const messageBuffer = await mail.compile().build();
+
+    const encodedMessage = messageBuffer.toString('base64')
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=+$/, '');
+
+    const result = await gmail.users.messages.send({
+        userId: 'me',
+        requestBody: { raw: encodedMessage }
+    });
+
+    console.log(`[Email] Sukses terkirim via Gmail API. ID: ${result.data.id}`);
+    return result.data.id;
+}
+
 async function getClientScopeInfo(oauthClient) {
     try {
         const accessToken = await oauthClient.getAccessToken();
@@ -478,7 +555,7 @@ app.post('/api/resend-email', async (req, res) => {
         }
 
         // --- STEP E: Kirim Email via GMAIL API ---
-        const fromAddress = `"Sparta System Resend Email" <${getEnvValue('EMAIL_USER')}>`;
+        const fromAddress = `"Sparta System RE-EMAIL" <${getEnvValue('EMAIL_USER')}>`;
 
         async function sendMailViaGmail(mailOptions) {
             const mail = new MailComposer(mailOptions);
@@ -501,7 +578,7 @@ app.post('/api/resend-email', async (req, res) => {
         let sentMessageIds = [];
 
         if (isFinalApproved) {
-            const subject = `[RE-EMAIL][FINAL - DISETUJUI] Pengajuan RAB Proyek ${namaToko}: ${proyek} - ${rowLingkup}`;
+            const subject = `[FINAL - DISETUJUI] Pengajuan RAB Proyek ${namaToko}: ${proyek} - ${rowLingkup}`;
             const baseBody = buildRabFinalApprovedEmailHtml({
                 namaToko,
                 proyek,
@@ -548,8 +625,8 @@ app.post('/api/resend-email', async (req, res) => {
                 from: fromAddress,
                 to: recipientEmailsStr,
                 subject: approvalLevel === 'coordinator'
-                    ? `[RE-EMAIL][TAHAP 1: PERLU PERSETUJUAN] RAB Proyek ${proyek} - ${rowLingkup}`
-                    : `[RE-EMAIL][TAHAP 2: PERLU PERSETUJUAN] RAB Proyek ${proyek} - ${rowLingkup}`,
+                    ? `[TAHAP 1: PERLU PERSETUJUAN] RAB Proyek ${proyek} - ${rowLingkup}`
+                    : `[TAHAP 2: PERLU PERSETUJUAN] RAB Proyek ${proyek} - ${rowLingkup}`,
                 html: buildRabApprovalEmailHtml({
                     level: role,
                     proyek,
@@ -574,6 +651,255 @@ app.post('/api/resend-email', async (req, res) => {
     } catch (error) {
         console.error('Terjadi kesalahan:', error);
         return res.status(500).json({ error: 'Terjadi kesalahan internal server.', details: error.message });
+    }
+});
+
+app.post('/api/resend-email-spk', async (req, res) => {
+    const { ulok, lingkup } = req.body;
+
+    if (!ulok || !lingkup) {
+        return res.status(400).json({ error: 'Nomor Ulok dan Lingkup Pekerjaan harus diisi.' });
+    }
+
+    try {
+        console.log(`[API-SPK] Memproses Ulok: ${ulok}, Lingkup: ${lingkup}...`);
+
+        const sheetId = getEnvValue('DOC_SHEET_ID');
+        const fromAddress = `"Sparta System RE-EMAIL" <${getEnvValue('EMAIL_USER')}>`;
+
+        const spkResp = await sheets.spreadsheets.values.get({
+            spreadsheetId: sheetId,
+            range: 'SPK_Data!A:AZ',
+        });
+
+        const spkRows = spkResp.data.values;
+        if (!spkRows || spkRows.length === 0) {
+            return res.status(404).json({ error: 'Sheet SPK_Data kosong.' });
+        }
+
+        const spkHeaders = spkRows[0];
+        const dataRows = spkRows.slice(1);
+        const targetUlok = normalizeString(ulok);
+        const targetLingkup = String(lingkup).trim().toLowerCase();
+
+        const targetRowRelativeIndex = dataRows.findIndex(row => {
+            const rowUlok = normalizeString(getCellByHeaders(row, spkHeaders, ['Nomor Ulok']));
+            const rowLingkup = String(getCellByHeaders(row, spkHeaders, ['Lingkup Pekerjaan', 'Lingkup_Pekerjaan']) || '').trim().toLowerCase();
+            return rowUlok === targetUlok && rowLingkup === targetLingkup;
+        });
+
+        if (targetRowRelativeIndex === -1) {
+            return res.status(404).json({ error: 'Data SPK tidak ditemukan untuk Nomor Ulok + Lingkup tersebut.' });
+        }
+
+        const row = dataRows[targetRowRelativeIndex];
+        const sheetRowNumber = targetRowRelativeIndex + 2;
+
+        const status = String(getCellByHeaders(row, spkHeaders, ['Status'])).trim();
+        const cabang = String(getCellByHeaders(row, spkHeaders, ['Cabang'])).trim();
+        const nomorUlok = String(getCellByHeaders(row, spkHeaders, ['Nomor Ulok'])).trim();
+        const namaToko = String(getCellByHeaders(row, spkHeaders, ['Nama_Toko', 'nama_toko'])).trim();
+        const kodeToko = String(getCellByHeaders(row, spkHeaders, ['Kode Toko', 'kode_toko'])).trim();
+        const jenisToko = String(getCellByHeaders(row, spkHeaders, ['Jenis_Toko', 'Proyek'])).trim();
+        const lingkupPekerjaan = String(getCellByHeaders(row, spkHeaders, ['Lingkup Pekerjaan', 'Lingkup_Pekerjaan'])).trim();
+        const linkPdf = String(getCellByHeaders(row, spkHeaders, ['Link PDF'])).trim();
+        const initiatorEmail = String(getCellByHeaders(row, spkHeaders, ['Dibuat Oleh', 'Email_Pembuat', 'EMAIL_PEMBUAT'])).trim();
+        const approverEmail = String(getCellByHeaders(row, spkHeaders, ['Disetujui Oleh'])).trim();
+        const alasanPenolakan = String(getCellByHeaders(row, spkHeaders, ['Alasan Penolakan'])).trim();
+
+        if (!cabang) {
+            return res.status(400).json({ error: 'Kolom Cabang SPK kosong.' });
+        }
+
+        const cabangResp = await sheets.spreadsheets.values.get({
+            spreadsheetId: sheetId,
+            range: 'Cabang!A:Z',
+        });
+        const cabangRows = cabangResp.data.values;
+        if (!cabangRows || cabangRows.length === 0) {
+            return res.status(404).json({ error: 'Sheet Cabang kosong.' });
+        }
+
+        const cabangHeaders = cabangRows[0].map(h => String(h || '').trim().toUpperCase());
+        const idxCabang = cabangHeaders.indexOf('CABANG');
+        const idxJabatan = cabangHeaders.indexOf('JABATAN');
+        const idxEmail = cabangHeaders.indexOf('EMAIL_SAT');
+        const targetCabangUpper = cabang.toUpperCase();
+
+        const getEmailsByJabatan = (jabatanName) => cabangRows.slice(1)
+            .filter(cRow => {
+                const valCabang = String(cRow[idxCabang] || '').trim().toUpperCase();
+                const valJabatan = String(cRow[idxJabatan] || '').trim().toUpperCase();
+                return valCabang === targetCabangUpper && valJabatan === jabatanName.toUpperCase();
+            })
+            .map(cRow => String(cRow[idxEmail] || '').trim())
+            .filter(Boolean);
+
+        const branchManagerEmails = getEmailsByJabatan('BRANCH MANAGER');
+        const managerEmails = getEmailsByJabatan('BRANCH BUILDING & MAINTENANCE MANAGER');
+        const coordinatorEmails = getEmailsByJabatan('BRANCH BUILDING COORDINATOR');
+
+        const attachments = [];
+        const spkPdfId = extractFileId(linkPdf);
+        if (spkPdfId) {
+            const spkPdfBuffer = await downloadDriveFile(spkPdfId);
+            if (spkPdfBuffer) {
+                attachments.push({
+                    filename: status === 'SPK Disetujui'
+                        ? `SPK_DISETUJUI_${jenisToko || 'PROYEK'}_${nomorUlok || 'ULOK'}.pdf`.replace(/\s+/g, '_')
+                        : `SPK_${jenisToko || 'PROYEK'}_${nomorUlok || 'ULOK'}.pdf`.replace(/\s+/g, '_'),
+                    content: spkPdfBuffer,
+                });
+            }
+        }
+
+        if (status === 'Menunggu Persetujuan Branch Manager') {
+            const bmEmail = branchManagerEmails[0] || approverEmail;
+            if (!bmEmail) {
+                return res.status(404).json({ error: `Email Branch Manager untuk cabang ${cabang} tidak ditemukan.` });
+            }
+
+            const approvalUrl = `${SPARTA_BACKEND_BASE_URL}/api/handle_spk_approval?action=approve&row=${sheetRowNumber}&approver=${encodeURIComponent(bmEmail)}`;
+            const rejectionUrl = `${SPARTA_BACKEND_BASE_URL}/api/reject_form/spk?row=${sheetRowNumber}&approver=${encodeURIComponent(bmEmail)}`;
+            const subject = `[PERLU PERSETUJUAN BM] SPK Proyek ${namaToko} (${kodeToko}): ${jenisToko} - ${lingkupPekerjaan}`;
+
+            const messageId = await sendMailViaGmail({
+                from: fromAddress,
+                to: bmEmail,
+                subject,
+                html: buildDocApprovalEmailHtml({
+                    docType: 'SPK',
+                    level: 'Branch Manager',
+                    proyek: jenisToko || namaToko,
+                    nomorUlok,
+                    approvalUrl,
+                    rejectionUrl,
+                }),
+                attachments,
+            });
+
+            return res.status(200).json({
+                message: 'Email SPK berhasil dikirim.',
+                recipient: bmEmail,
+                role: 'Branch Manager',
+                messageId,
+            });
+        }
+
+        if (status === 'SPK Disetujui') {
+            const form2Resp = await sheets.spreadsheets.values.get({
+                spreadsheetId: sheetId,
+                range: 'form2!A:AA',
+            });
+
+            const form2Rows = form2Resp.data.values || [];
+            const form2Headers = form2Rows[0] || [];
+            let pembuatRabEmail = '';
+
+            if (form2Rows.length > 1) {
+                const form2DataRows = form2Rows.slice(1);
+                const idxMatch = form2DataRows.findIndex(fRow => {
+                    const fUlok = normalizeString(getCellByHeaders(fRow, form2Headers, ['Nomor Ulok', 'Lokasi']));
+                    const fLingkup = String(getCellByHeaders(fRow, form2Headers, ['Lingkup Pekerjaan', 'Lingkup_Pekerjaan']) || '').trim().toLowerCase();
+                    return fUlok === normalizeString(nomorUlok) && fLingkup === String(lingkupPekerjaan).trim().toLowerCase();
+                });
+
+                if (idxMatch >= 0) {
+                    const form2Row = form2DataRows[idxMatch];
+                    pembuatRabEmail = String(getCellByHeaders(form2Row, form2Headers, ['Email_Pembuat', 'EMAIL_PEMBUAT'])).trim();
+                }
+            }
+
+            const bmEmail = approverEmail || branchManagerEmails[0] || '';
+            const bbmManagerEmail = managerEmails[0] || '';
+            const kontraktorList = pembuatRabEmail ? [pembuatRabEmail] : [];
+
+            const subject = `[DISETUJUI] SPK Proyek ${namaToko} (${kodeToko}): ${jenisToko} - ${lingkupPekerjaan}`;
+            const messageIds = [];
+
+            const otherRecipients = new Set();
+            if (initiatorEmail) otherRecipients.add(initiatorEmail);
+            if (pembuatRabEmail) otherRecipients.add(pembuatRabEmail);
+
+            if (bmEmail) {
+                const bodyBm = `<p>SPK yang Anda setujui untuk Toko <b>${escapeHtml(namaToko)}</b> pada proyek <b>${escapeHtml(jenisToko)} - ${escapeHtml(lingkupPekerjaan)}</b> (${escapeHtml(nomorUlok)}) telah disetujui sepenuhnya dan final.</p><p>File PDF final terlampir.</p>`;
+                messageIds.push(await sendMailViaGmail({ from: fromAddress, to: bmEmail, subject, html: bodyBm, attachments }));
+                otherRecipients.delete(bmEmail);
+            }
+
+            if (bbmManagerEmail) {
+                const bodyBbm = `<p>SPK yang diajukan untuk Toko <b>${escapeHtml(namaToko)}</b> pada proyek <b>${escapeHtml(jenisToko)} - ${escapeHtml(lingkupPekerjaan)}</b> (${escapeHtml(nomorUlok)}) telah disetujui oleh Branch Manager.</p><p>Silakan melakukan input PIC pengawasan melalui link berikut: <a href='https://frontend-form-virid.vercel.app/login-input_pic.html' target='_blank' rel='noopener noreferrer'>Input PIC Pengawasan</a></p><p>File PDF final terlampir.</p>`;
+                messageIds.push(await sendMailViaGmail({ from: fromAddress, to: bbmManagerEmail, subject, html: bodyBbm, attachments }));
+                otherRecipients.delete(bbmManagerEmail);
+            }
+
+            if (coordinatorEmails.length > 0) {
+                const bodyCoord = `<p>SPK untuk Toko <b>${escapeHtml(namaToko)}</b> pada proyek <b>${escapeHtml(jenisToko)} - ${escapeHtml(lingkupPekerjaan)}</b> (${escapeHtml(nomorUlok)}) telah disetujui oleh Branch Manager.</p><p>File PDF final terlampir.</p>`;
+                messageIds.push(await sendMailViaGmail({ from: fromAddress, to: coordinatorEmails.join(', '), subject, html: bodyCoord, attachments }));
+                coordinatorEmails.forEach(email => otherRecipients.delete(email));
+            }
+
+            if (kontraktorList.length > 0) {
+                const bodyOpname = `<p>SPK untuk Toko <b>${escapeHtml(namaToko)}</b> pada proyek <b>${escapeHtml(jenisToko)} - ${escapeHtml(lingkupPekerjaan)}</b> (${escapeHtml(nomorUlok)}) telah disetujui.</p><p>Silakan melakukan Opname melalui link berikut: <a href='https://sparta-alfamart.vercel.app' target='_blank' rel='noopener noreferrer'>Pengisian Opname</a></p><p>File PDF final terlampir.</p>`;
+                messageIds.push(await sendMailViaGmail({ from: fromAddress, to: kontraktorList.join(', '), subject, html: bodyOpname, attachments }));
+                kontraktorList.forEach(email => otherRecipients.delete(email));
+            }
+
+            if (otherRecipients.size > 0) {
+                const bodyDefault = `<p>SPK yang Anda ajukan untuk Toko <b>${escapeHtml(namaToko)}</b> pada proyek <b>${escapeHtml(jenisToko)} - ${escapeHtml(lingkupPekerjaan)}</b> (${escapeHtml(nomorUlok)}) telah disetujui oleh Branch Manager.</p><p>File PDF final terlampir.</p>`;
+                messageIds.push(await sendMailViaGmail({ from: fromAddress, to: Array.from(otherRecipients).join(', '), subject, html: bodyDefault, attachments }));
+            }
+
+            if (messageIds.length === 0) {
+                return res.status(404).json({ error: 'Tidak ada penerima email SPK final yang valid.' });
+            }
+
+            const recipientSummary = [
+                bmEmail,
+                bbmManagerEmail,
+                ...coordinatorEmails,
+                ...kontraktorList,
+                ...Array.from(otherRecipients),
+            ].filter(Boolean);
+
+            return res.status(200).json({
+                message: 'Email SPK final disetujui berhasil dikirim.',
+                recipient: [...new Set(recipientSummary)].join(', '),
+                role: 'SPK Disetujui',
+                messageId: messageIds[0],
+                messageIds,
+            });
+        }
+
+        if (status === 'SPK Ditolak') {
+            if (!initiatorEmail) {
+                return res.status(404).json({ error: 'Email pembuat SPK (Dibuat Oleh) tidak ditemukan untuk status ditolak.' });
+            }
+
+            const subject = `[DITOLAK] SPK untuk Proyek ${namaToko} (${kodeToko}): ${jenisToko} - ${lingkupPekerjaan}`;
+            const body = `<p>SPK yang Anda ajukan untuk Toko <b>${escapeHtml(namaToko)}</b> pada proyek <b>${escapeHtml(jenisToko)} - ${escapeHtml(lingkupPekerjaan)}</b> (${escapeHtml(nomorUlok)}) telah ditolak oleh Branch Manager.</p><p><b>Alasan Penolakan:</b></p><p><i>${escapeHtml(alasanPenolakan || 'Tidak ada alasan yang diberikan.')}</i></p><p>Silakan ajukan revisi SPK Anda melalui link berikut:</p><p><a href='https://sparta-alfamart.vercel.app' target='_blank' rel='noopener noreferrer'>Input Ulang SPK</a></p>`;
+
+            const messageId = await sendMailViaGmail({
+                from: fromAddress,
+                to: initiatorEmail,
+                subject,
+                html: body,
+            });
+
+            return res.status(200).json({
+                message: 'Email SPK status ditolak berhasil dikirim.',
+                recipient: initiatorEmail,
+                role: 'SPK Ditolak',
+                messageId,
+            });
+        }
+
+        return res.status(200).json({
+            message: `Email SPK tidak dikirim. Status saat ini: "${status}"`,
+        });
+    } catch (error) {
+        console.error('Terjadi kesalahan SPK:', error);
+        return res.status(500).json({ error: 'Terjadi kesalahan internal server (SPK).', details: error.message });
     }
 });
 
