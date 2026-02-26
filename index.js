@@ -179,6 +179,14 @@ function normalizeString(str) {
         .trim();
 }
 
+function normalizeLooseText(str) {
+    if (!str) return "";
+    return String(str)
+        .toUpperCase()
+        .replace(/[^A-Z0-9]/g, "")
+        .trim();
+}
+
 const SPARTA_BACKEND_BASE_URL = getEnvValue('SPARTA_BACKEND_BASE_URL') || 'https://sparta-backend-5hdj.onrender.com';
 
 function escapeHtml(text) {
@@ -416,12 +424,14 @@ app.post('/api/resend-email', async (req, res) => {
         const headersForm2 = rowsForm2[0].map(h => String(h || '').trim().toUpperCase());
 
         const normalizedTargetUlok = normalizeString(ulok);
-        const normalizedTargetLingkup = String(lingkup).trim().toLowerCase();
+        const normalizedTargetLingkup = normalizeLooseText(lingkup);
+        const form2UlokHeaders = ['Nomor Ulok', 'NOMOR ULOK', 'Lokasi', 'LOKASI'];
+        const form2LingkupHeaders = ['Lingkup Pekerjaan', 'LINGKUP PEKERJAAN', 'Lingkup_Pekerjaan', 'LINGKUP_PEKERJAAN'];
 
         const dataRowsForm2 = rowsForm2.slice(1);
         const targetRowRelativeIndex = dataRowsForm2.findIndex(row => {
-            const rowUlok = normalizeString(row[9]);
-            const rowLingkup = String(row[13] || "").trim().toLowerCase();
+            const rowUlok = normalizeString(getCellByHeaders(row, headersForm2, form2UlokHeaders, row[9] || ''));
+            const rowLingkup = normalizeLooseText(getCellByHeaders(row, headersForm2, form2LingkupHeaders, row[13] || ''));
             return rowUlok === normalizedTargetUlok && rowLingkup === normalizedTargetLingkup;
         });
 
@@ -430,11 +440,16 @@ app.post('/api/resend-email', async (req, res) => {
         const targetRow = dataRowsForm2[targetRowRelativeIndex];
         const sheetRowNumber = targetRowRelativeIndex + 2;
 
-        const [
-            status, timestamp, linkPdf, linkPdfNonSbo,
-            emailKoord_old, waktuKoord, emailManager_old, waktuManager,
-            emailPembuat, rowUlok, proyek, alamat, cabang, rowLingkup
-        ] = targetRow;
+        const status = String(getCellByHeaders(targetRow, headersForm2, ['Status', 'STATUS'], targetRow[0] || '')).trim();
+        const linkPdf = String(getCellByHeaders(targetRow, headersForm2, ['Link PDF', 'LINK PDF'], targetRow[2] || '')).trim();
+        const linkPdfNonSbo = String(getCellByHeaders(targetRow, headersForm2, ['Link PDF Non SBO', 'LINK PDF NON SBO', 'Link PDF Non-SBO', 'LINK PDF NON-SBO'], targetRow[3] || '')).trim();
+        const emailKoord_old = String(getCellByHeaders(targetRow, headersForm2, ['Email Koordinator', 'EMAIL KOORDINATOR', 'EMAIL KOORD', 'Email Koord'], targetRow[4] || '')).trim();
+        const emailManager_old = String(getCellByHeaders(targetRow, headersForm2, ['Email Manager', 'EMAIL MANAGER'], targetRow[6] || '')).trim();
+        const emailPembuat = String(getCellByHeaders(targetRow, headersForm2, ['Email_Pembuat', 'EMAIL_PEMBUAT', 'Dibuat Oleh'], targetRow[8] || '')).trim();
+        const rowUlok = String(getCellByHeaders(targetRow, headersForm2, form2UlokHeaders, targetRow[9] || '')).trim();
+        const proyek = String(getCellByHeaders(targetRow, headersForm2, ['Proyek', 'PROYEK', 'Jenis_Toko', 'JENIS_TOKO'], targetRow[10] || '')).trim();
+        const cabang = String(getCellByHeaders(targetRow, headersForm2, ['Cabang', 'CABANG'], targetRow[12] || '')).trim();
+        const rowLingkup = String(getCellByHeaders(targetRow, headersForm2, form2LingkupHeaders, targetRow[13] || '')).trim();
         const idxLinkPdfRekap = headersForm2.indexOf('LINK PDF REKAPITULASI');
         const linkPdfRekap = idxLinkPdfRekap >= 0 ? targetRow[idxLinkPdfRekap] : targetRow[25];
         const idxNamaToko = headersForm2.indexOf('NAMA_TOKO');
@@ -683,11 +698,11 @@ app.post('/api/resend-email-spk', async (req, res) => {
         const spkHeaders = spkRows[0];
         const dataRows = spkRows.slice(1);
         const targetUlok = normalizeString(ulok);
-        const targetLingkup = String(lingkup).trim().toLowerCase();
+        const targetLingkup = normalizeLooseText(lingkup);
 
         const targetRowRelativeIndex = dataRows.findIndex(row => {
             const rowUlok = normalizeString(getCellByHeaders(row, spkHeaders, ['Nomor Ulok']));
-            const rowLingkup = String(getCellByHeaders(row, spkHeaders, ['Lingkup Pekerjaan', 'Lingkup_Pekerjaan']) || '').trim().toLowerCase();
+            const rowLingkup = normalizeLooseText(getCellByHeaders(row, spkHeaders, ['Lingkup Pekerjaan', 'Lingkup_Pekerjaan']) || '');
             return rowUlok === targetUlok && rowLingkup === targetLingkup;
         });
 
@@ -803,8 +818,8 @@ app.post('/api/resend-email-spk', async (req, res) => {
                 const form2DataRows = form2Rows.slice(1);
                 const idxMatch = form2DataRows.findIndex(fRow => {
                     const fUlok = normalizeString(getCellByHeaders(fRow, form2Headers, ['Nomor Ulok', 'Lokasi']));
-                    const fLingkup = String(getCellByHeaders(fRow, form2Headers, ['Lingkup Pekerjaan', 'Lingkup_Pekerjaan']) || '').trim().toLowerCase();
-                    return fUlok === normalizeString(nomorUlok) && fLingkup === String(lingkupPekerjaan).trim().toLowerCase();
+                    const fLingkup = normalizeLooseText(getCellByHeaders(fRow, form2Headers, ['Lingkup Pekerjaan', 'Lingkup_Pekerjaan']) || '');
+                    return fUlok === normalizeString(nomorUlok) && fLingkup === normalizeLooseText(lingkupPekerjaan);
                 });
 
                 if (idxMatch >= 0) {
