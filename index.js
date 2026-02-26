@@ -173,7 +173,10 @@ async function downloadDriveFile(fileId) {
 
 function normalizeString(str) {
     if (!str) return "";
-    return String(str).replace(/-/g, "").replace(/\s/g, "").trim().toUpperCase();
+    return String(str)
+        .toUpperCase()
+        .replace(/[^A-Z0-9]/g, "")
+        .trim();
 }
 
 const SPARTA_BACKEND_BASE_URL = getEnvValue('SPARTA_BACKEND_BASE_URL') || 'https://sparta-backend-5hdj.onrender.com';
